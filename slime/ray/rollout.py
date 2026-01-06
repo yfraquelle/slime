@@ -24,6 +24,7 @@ from slime.utils.ray_utils import Box
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.tracking_utils import init_tracking
 from slime.utils.types import Sample
+from react_code_agent_slime_data_source import AgentSample
 
 from ..utils.metric_utils import has_repetition
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -145,7 +146,7 @@ class RolloutManager:
                 self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
                 weights_only=False,
             )["samples"]
-            data = [Sample.from_dict(sample) for sample in data]
+            data = [AgentSample.from_dict(sample) for sample in data]
             if (ratio := self.args.load_debug_rollout_data_subsample) is not None:
                 original_num_rows = len(data)
                 rough_subsample_num_rows = int(original_num_rows * ratio)

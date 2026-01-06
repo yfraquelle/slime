@@ -170,6 +170,7 @@ class Attention(HuggingfaceAttention):
         layer_number: int,
         cp_comm_type: str = "p2p",
         pg_collection=None,
+        model_comm_pgs=None
     ):
         super().__init__(
             args,

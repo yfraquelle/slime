@@ -16,7 +16,8 @@ from tqdm import tqdm
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 from slime.utils.async_utils import run
-from slime.utils.data import Dataset
+# from slime.utils.data import Dataset
+from react_code_agent_slime_data_source import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
 from slime.utils.mask_utils import get_response_lengths
@@ -243,7 +244,7 @@ async def generate_and_rm(
         with state.dp_rank_context() as _:
             if args.custom_generate_function_path is not None:
                 custom_generate_func = load_function(args.custom_generate_function_path)
-                sample = await custom_generate_func(args, sample, sampling_params)
+                sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
             else:
                 sample = await generate(args, sample, sampling_params)
 

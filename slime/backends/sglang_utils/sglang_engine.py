@@ -30,13 +30,16 @@ def get_base_gpu_id(args, rank):
             start_index = (num_actor_gpus + num_critic_gpus + rank * num_gpus) % args.num_gpus_per_node
     return start_index
 
+def launch_server_instrumented(server_args):
+    from slime.rollout.sglang_instrumentation import instrument_sglang
+    instrument_sglang()
+    from sglang.srt.entrypoints.http_server import launch_server
+    launch_server(server_args)
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=launch_server_instrumented, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
