@@ -177,6 +177,10 @@ async def _post(client, url, payload, max_retries=60):
 
             if isinstance(e, httpx.HTTPStatusError):
                 response_text = e.response.text
+                # Do not retry for 400 Client Error (e.g. context length exceeded)
+                if e.response.status_code == 400 and "context length" in e.response.text:
+                    logger.error(f"over context length error: {response_text}, failing immediately.")
+                    raise e
             else:
                 response_text = None
 
