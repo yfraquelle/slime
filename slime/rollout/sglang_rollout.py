@@ -373,6 +373,12 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            # check if any sample in the group is aborted, truncated, or empty
+            if any(sample.status in [Sample.Status.ABORTED, Sample.Status.TRUNCATED] or not sample.tokens for sample in group):
+                logger.warning(f"Discarding group with aborted, truncated, or empty sample(s)")
+                state.remaining_batch_size -= 1
+                continue
+
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
