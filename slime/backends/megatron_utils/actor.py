@@ -15,15 +15,14 @@ from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
-from slime.utils.context_utils import with_defer
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
+from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
-from slime.utils.ray_utils import Box
+from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
-from slime.utils.timer import Timer, inverse_timer, timer
-from slime.utils.tracking_utils import init_tracking
+from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
@@ -214,8 +213,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
             rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
-        if "rollout_log_probs" in rollout_data:
-            rollout_data["rollout_log_probs"] = [
+        for key in ["rollout_log_probs", "teacher_log_probs"]:
+            if key not in rollout_data:
+                continue
+            rollout_data[key] = [
                 torch.tensor(
                     slice_log_prob_with_cp(
                         log_prob,
@@ -229,7 +230,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
                 for i, (log_prob, total_length, response_length) in enumerate(
                     zip(
-                        rollout_data["rollout_log_probs"],
+                        rollout_data[key],
                         rollout_data["total_lengths"],
                         rollout_data["response_lengths"],
                         strict=False,
