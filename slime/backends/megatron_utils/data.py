@@ -141,6 +141,22 @@ def get_batch(
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
+    # 1. 整个 Micro-batch 的总长度 (包含 Padding)
+    total_tokens = tokens.numel() 
+    
+    # 2. 实际参与 Loss 计算的 Token 数量 (loss_mask == 1)
+    # 注意: tokens 可能经过了 CP (Context Parallel) 切分，这里统计的是当前 Rank 分担的部分
+    active_tokens = loss_masks.sum().item()
+    
+    # 3. 如果想看原始序列长度 (不含 Padding)
+    raw_seq_lens = [t.size(0) for t in batch["unconcat_tokens"]]
+    
+    # 为了避免 Log 刷屏，可以每隔几十个 Step 打印一次
+    if total_tokens>2048*4:
+        print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
+                f"Active(Loss Mask 1)={active_tokens}, "
+                f"RawLengths={raw_seq_lens}")
+
     return batch
 
 

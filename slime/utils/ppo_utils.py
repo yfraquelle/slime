@@ -648,6 +648,7 @@ def chunked_gae(
 
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
+    # print(f"logit size: {logits.size()}")
     # TODO: not sure why we need to clone the logits here.
     # Without the clone, the backward will trigger inplace edit error.
     # It seems that the function with tp will modify the logits inplace.

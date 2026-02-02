@@ -382,7 +382,7 @@ async def generate_rollout_async(
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
             # check if any sample in the group is aborted, truncated, or empty
-            if any(sample.status in [Sample.Status.ABORTED, Sample.Status.TRUNCATED] or not sample.tokens for sample in group):
+            if any(sample.status == Sample.Status.ABORTED or not sample.tokens for sample in group):
                 logger.warning(f"Discarding group with aborted, truncated, or empty sample(s)")
                 state.remaining_batch_size -= 1
                 continue
@@ -425,6 +425,13 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
+    # 计算比例
+    total_submitted = len(all_data) # 包含被丢弃的
+    final_collected = len(data)     # 真正进入训练的
+    if total_submitted > 0:
+        discard_rate = (total_submitted - final_collected) / total_submitted
+        logger.info(f"Rollout Summary: Collected {final_collected}/{total_submitted} groups. Discard Rate: {discard_rate:.2%}")
+        
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
 
 
