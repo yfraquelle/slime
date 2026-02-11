@@ -1,6 +1,7 @@
 import itertools
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -125,7 +126,7 @@ class RolloutManager:
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
-        return len(self.data_source.dataset) // self.args.rollout_batch_size
+        return len(self.data_source) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
         start_time = time.time()
@@ -388,7 +389,7 @@ class RolloutManager:
         if samples[0].multimodal_train_inputs is not None:
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
-        if "teacher_log_probs" in samples[0].__dict__:
+        if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
         return train_data
@@ -485,14 +486,16 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         )
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-            "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-            "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            key: os.environ.get(key, default_val)
+            for key, default_val in {
+                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+                "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            }.items()
         }
 
         worker_type = "regular"

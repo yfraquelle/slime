@@ -169,7 +169,7 @@ def get_log_probs_and_entropy(
     }
     if with_entropy:
         res["entropy"] = entropy_list
-    return res
+    return torch.empty((0,), device=logits.device), res
 
 
 def get_values(
@@ -214,9 +214,50 @@ def get_values(
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
 
-    return {
+    return torch.empty((0,), device=logits.device), {
         "values": value_list,
     }
+
+
+def apply_opd_kl_to_advantages(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    advantages: list[torch.Tensor],
+    student_log_probs: list[torch.Tensor] | None,
+) -> None:
+    """Apply on-policy distillation KL penalty to advantages.
+
+    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
+    to advantages in-place. This is orthogonal to the base advantage estimator.
+
+    Args:
+        args: Configuration containing `use_opd` and `opd_kl_coef`.
+        rollout_data: Dict containing "teacher_log_probs".
+        advantages: List of advantage tensors to modify in-place.
+        student_log_probs: List of student log-probability tensors.
+
+    References:
+        https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
+    """
+
+    if student_log_probs is None:
+        return
+
+    teacher_log_probs = rollout_data.get("teacher_log_probs")
+    if teacher_log_probs is None:
+        raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+
+    device = student_log_probs[0].device
+    teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+
+    reverse_kls = []
+    for i, adv in enumerate(advantages):
+        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        reverse_kls.append(reverse_kl)
+
+    # Store reverse KL for logging
+    rollout_data["opd_reverse_kl"] = reverse_kls
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -250,7 +291,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
     # return when not the last pp stage.
-    if log_probs is None and values is None:
+    if not mpu.is_pipeline_last_stage():
         return
 
     if args.kl_coef == 0 or not log_probs:
@@ -310,24 +351,17 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         )
         returns = advantages
 
-    elif args.advantage_estimator == "on_policy_distillation":
-        student_log_probs = log_probs
-        teacher_log_probs = rollout_data.get("teacher_log_probs")
-        response_lengths = rollout_data.get("response_lengths")
-        device = student_log_probs[0].device
-        teacher_log_probs = [t_log_prob.to(device=device) for t_log_prob in teacher_log_probs]
-        teacher_log_probs = [
-            t_log_prob[-response_length:]
-            for t_log_prob, response_length in zip(teacher_log_probs, response_lengths, strict=False)
-        ]
-        advantages = [
-            teacher_log_prob - student_log_prob
-            for teacher_log_prob, student_log_prob in zip(teacher_log_probs, student_log_probs, strict=False)
-        ]
-        returns = advantages
-
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+
+    # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
+    if args.use_opd:
+        apply_opd_kl_to_advantages(
+            args=args,
+            rollout_data=rollout_data,
+            advantages=advantages,
+            student_log_probs=log_probs,
+        )
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
@@ -476,7 +510,7 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
 
-    log_probs_and_entropy = get_log_probs_and_entropy(
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
@@ -652,6 +686,11 @@ def policy_loss_function(
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
+    # Add OPD metrics if available
+    if "opd_reverse_kl" in batch:
+        opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
+        reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+
     return loss, reported_loss
 
 
@@ -680,7 +719,7 @@ def value_loss_function(
     """
     old_values = torch.cat(batch["values"], dim=0)
 
-    values = get_values(
+    _, values = get_values(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
@@ -738,7 +777,7 @@ def sft_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
-    log_probs_and_entropy = get_log_probs_and_entropy(
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
@@ -795,7 +834,6 @@ def loss_function(
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
-
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -833,7 +871,7 @@ def loss_function(
 
     return (
         loss,
-        torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
+        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
             "values": torch.tensor(

@@ -174,6 +174,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
+            parser.add_argument(
+                "--only-train-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""List of regex patterns of parameter names to TRAIN. All other parameters will be FROZEN. 
+                        Supports Python regex syntax (re.search).
+
+                        Examples:
+                        1. Train ONLY MoE experts:
+                            --only-train-params-name-list experts
+
+                        2. Train ONLY Indexer parameters:
+                            --only-train-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
+
+                        3. Train ONLY Layer 20 to 23:
+                            --only-train-params-name-list layers\.2[0-3]\.
+                        """,
+            )
+
+            parser.add_argument(
+                "--freeze-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""List of regex patterns of parameter names to FREEZE. Other parameters will remain trainable.
+                        Supports Python regex syntax (re.search).
+
+                        Examples:
+                        1. Freeze Embeddings and Output Layer (common for fine-tuning):
+                            --freeze-params-name-list embedding output_layer
+
+                        2. Freeze Indexer parameters:
+                            --freeze-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
+
+                        3. Freeze specific projection layers (e.g., all Gate/Up projections):
+                            --freeze-params-name-list linear_fc1
+                        """,
+            )
 
             return parser
 
@@ -780,9 +819,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
-                    "on_policy_distillation",
                 ],
                 default="grpo",
+                help=(
+                    "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
+                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
+                ),
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -919,6 +961,49 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1e-4,
                 help="The threshold for Off-Policy Sequence Masking (OPSM).",
+            )
+            return parser
+
+        def add_on_policy_distillation_arguments(parser):
+            """Add on-policy distillation (OPD) related arguments.
+
+            OPD is orthogonal to advantage estimators and can be applied on top of
+            any estimator (GRPO, PPO, etc.) by adding a KL penalty to advantages.
+            """
+            parser.add_argument(
+                "--use-opd",
+                action="store_true",
+                default=False,
+                help="Enable on-policy distillation (OPD). Must specify --opd-type when enabled.",
+            )
+            parser.add_argument(
+                "--opd-type",
+                type=str,
+                choices=["sglang", "megatron"],
+                default=None,
+                help=(
+                    "Type of on-policy distillation. "
+                    "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-coef",
+                type=float,
+                default=1.0,
+                help="On-policy distillation KL penalty coefficient. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-teacher-load",
+                type=str,
+                default=None,
+                help=(
+                    "The checkpoint for OPD teacher model. Required when --opd-type=megatron. "
+                    "The teacher model should have the same architecture as policy/ref model."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
             return parser
 
@@ -1368,6 +1453,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
         parser = add_algo_arguments(parser)
+        parser = add_on_policy_distillation_arguments(parser)
         parser = add_wandb_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_router_arguments(parser)
@@ -1408,7 +1494,7 @@ def parse_args(add_custom_arguments=None):
         from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
         args = megatron_parse_args(extra_args_provider=add_slime_arguments)
-        if args.hf_checkpoint:
+        if args.hf_checkpoint and not args.debug_rollout_only:
             hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
             hf_validate_args(args, hf_config)
 
@@ -1516,6 +1602,38 @@ def slime_validate_args(args):
                 f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
                 "please make sure it is a valid megatron checkpoint directory."
             )
+
+    # Validate on-policy distillation (OPD) arguments
+    if args.use_opd:
+        if args.opd_type is None:
+            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+
+        if args.opd_type == "megatron":
+            if args.opd_teacher_load is None:
+                raise ValueError(
+                    "--opd-teacher-load is required when --opd-type=megatron. "
+                    "Please provide the path to the teacher model checkpoint."
+                )
+            if not os.path.exists(args.opd_teacher_load):
+                raise FileNotFoundError(
+                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
+                )
+            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
+                logger.info(
+                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
+                    "please make sure it is a valid megatron checkpoint directory."
+                )
+
+        elif args.opd_type == "sglang":
+            if args.opd_teacher_load is not None:
+                raise ValueError(
+                    "--opd-teacher-load should not be set when --opd-type=sglang. "
+                    "In sglang mode, teacher log-probs are obtained from external server during rollout."
+                )
+    else:
+        # If OPD is not enabled, opd_teacher_load should not be set
+        if args.opd_teacher_load is not None:
+            raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
     # TODO: During loading, we need to set the start_rollout_id here.
     if args.megatron_to_hf_mode == "bridge":
@@ -1714,6 +1832,9 @@ def slime_validate_args(args):
         assert (
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
+
+    if args.only_train_params_name_list and args.freeze_params_name_list:
+        raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
 
 
 def hf_validate_args(args, hf_config):
