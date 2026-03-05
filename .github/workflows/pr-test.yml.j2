@@ -4,14 +4,8 @@
       'tests': [
         {'test_file': 'test_qwen2.5_0.5B_gsm8k_async_short.py', 'num_gpus': 4},
         {'test_file': 'test_qwen2.5_0.5B_gsm8k_short.py', 'num_gpus': 4},
-      ],
-    },
-    'e2e-test-fsdp': {
-      'label': 'run-ci-fsdp',
-      'tests': [
-        {'test_file': 'test_qwen3_4B_fsdp_true_on_policy.py --colocated', 'num_gpus': 4},
-        {'test_file': 'test_qwen3_vl_4B_fsdp.py', 'num_gpus': 8},
-        {'test_file': 'test_qwen3_0.6B_megatron_fsdp_align.py', 'num_gpus': 4},
+        {'test_file': 'test_qwen2.5_0.5B_sglang_config.py', 'num_gpus': 8},
+        {'test_file': 'test_qwen2.5_0.5B_sglang_config_distributed.py', 'num_gpus': 8},
       ],
     },
     'e2e-test-megatron': {
@@ -22,6 +16,7 @@
         {'test_file': 'test_qwen3_30B_A3B_r3.py', 'num_gpus': 8, 'use_deepep': '1', 'use_fp8_rollout': '1', 'enable_eval': '0'},
         {'test_file': 'test_qwen3_30B_A3B_r3.py', 'num_gpus': 8, 'enable_eval': '0'},
         {'test_file': 'test_qwen3_4B_ppo.py', 'num_gpus': 8},
+        {'test_file': 'test_qwen3_4B_ppo_train_critic_only.py', 'num_gpus': 8},
         {'test_file': 'test_moonlight_16B_A3B.py', 'num_gpus': 8},
         {'test_file': 'test_moonlight_16B_A3B_r3.py', 'num_gpus': 8, 'enable_eval': '0'},
         {'test_file': 'test_mimo_7B_mtp_only_grad.py', 'num_gpus': 8},
@@ -33,7 +28,6 @@
       'label': 'run-ci-precision',
       'tests': [
         {'test_file': 'test_qwen3_0.6B_parallel_check.py', 'num_gpus': 8},
-        {'test_file': 'test_qwen3_0.6B_megatron_fsdp_align.py', 'num_gpus': 4},
       ],
     },
     'e2e-test-ckpt': {
@@ -44,25 +38,32 @@
       ],
     },
 
+    'e2e-test-plugin-contracts': {
+      'label': 'run-ci-plugin-contracts',
+      'always': True,
+      'cpu': True,
+      'tests': [
+        {'test_file': 'plugin_contracts/test_plugin_rollout_contracts.py', 'num_gpus': 0},
+        {'test_file': 'plugin_contracts/test_plugin_runtime_hook_contracts.py', 'num_gpus': 0},
+        {'test_file': 'plugin_contracts/test_plugin_path_loading_contracts.py', 'num_gpus': 0},
+        {'test_file': 'plugin_contracts/test_plugin_generate_contracts.py', 'num_gpus': 0},
+      ],
+    },
+
     'e2e-test-image': {
       'label': 'run-ci-image',
       'image': 'slimerl/slime-test:latest',
       'tests': [
         {'test_file': 'test_qwen2.5_0.5B_gsm8k_async_short.py', 'num_gpus': 4},
         {'test_file': 'test_qwen2.5_0.5B_gsm8k_short.py', 'num_gpus': 4},
-        {'test_file': 'test_qwen3_4B_fsdp_true_on_policy.py', 'num_gpus': 2},
-        {'test_file': 'test_qwen3_vl_4B_fsdp.py', 'num_gpus': 8},
         {'test_file': 'test_quick_start_glm4_9B.py', 'num_gpus': 8},
         {'test_file': 'test_qwen3_30B_A3B.py', 'num_gpus': 8},
         {'test_file': 'test_qwen3_4B_ppo.py', 'num_gpus': 8},
         {'test_file': 'test_moonlight_16B_A3B.py', 'num_gpus': 8},
         {'test_file': 'test_mimo_7B_mtp_only_grad.py', 'num_gpus': 8},
         {'test_file': 'test_qwen3_0.6B_parallel_check.py', 'num_gpus': 8},
-        {'test_file': 'test_qwen3_0.6B_megatron_fsdp_align.py', 'num_gpus': 4},
         {'test_file': 'test_qwen3_4B_ckpt.py', 'num_gpus': 8},
         {'test_file': 'test_qwen3_4B_ckpt.py --async-save', 'num_gpus': 8},
-        {'test_file': 'test_qwen2.5_0.5B_gsm8k.py', 'num_gpus': 2},
-        {'test_file': 'test_qwen2.5_0.5B_gsm8k_async.py', 'num_gpus': 2},
         {'test_file': 'test_qwen2.5_0.5B_debug_rollout_then_train.py', 'num_gpus': 8},
         {'test_file': 'test_qwen2.5_0.5B_opd_sglang.py', 'num_gpus': 8},
       ],
@@ -92,7 +93,14 @@ concurrency:
 jobs:
 <% for job_name, config in jobs.items() %>
   << job_name >>:
+<% if config.get('always') %>
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+<% else %>
     if: (github.event_name == 'workflow_dispatch') || (github.event.pull_request && contains(github.event.pull_request.labels.*.name, '<< config.label >>'))
+<% endif %>
+<% if config.get('cpu') %>
+    runs-on: ubuntu-latest
+<% else %>
     runs-on: self-hosted
     container:
       image: << config.image if config.image else 'slimerl/slime:latest' >>
@@ -111,6 +119,7 @@ jobs:
         -v /mnt/nvme0n1/slime_ci:/data/slime_ci
         -v /mnt/nvme0n1/slime_ci/models:/root/models
         -v /mnt/nvme0n1/slime_ci/datasets:/root/datasets
+<% endif %>
     strategy:
       fail-fast: false
       matrix:
@@ -129,14 +138,42 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+<% if config.get('cpu') %>
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest numpy packaging pyyaml omegaconf tqdm httpx pybase64 pylatexenc sympy aiohttp
+
+      - name: Install
+        shell: bash
+        run: cd $GITHUB_WORKSPACE && pip install -e . --no-deps
+<% else %>
 
       - name: Install
         shell: bash
         run: cd $GITHUB_WORKSPACE && pip install -e . --no-deps --break-system-packages
+<% endif %>
 
       - name: Execute
         shell: bash
-        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- python tests/${{ matrix.info.test_file }}
+        run: |
+          TEST_PATH="${{ matrix.info.test_file }}"
+          if [[ "$TEST_PATH" != tests/* ]]; then
+            TEST_PATH="tests/$TEST_PATH"
+          fi
+          if [ "${{ matrix.info.num_gpus }}" = "0" ]; then
+            python "$TEST_PATH"
+          else
+            python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- python "$TEST_PATH"
+          fi
 <% endfor %>
 
   e2e-test-changed-detect:
@@ -165,7 +202,7 @@ jobs:
         id: detect
         shell: bash
         run: |
-          CHANGED=$(git diff --name-only --diff-filter=AM origin/main...HEAD -- 'tests/test_*.py' || true)
+          CHANGED=$(git diff --name-only --diff-filter=AM origin/main...HEAD -- 'tests/test_*.py' 'tests/plugin_contracts/test_*.py' || true)
           if [ -z "$CHANGED" ]; then
             echo "No new or modified test files found."
             echo "has_tests=false" >> $GITHUB_OUTPUT
@@ -176,12 +213,11 @@ jobs:
             MATRIX="["
             FIRST=true
             for filepath in $CHANGED; do
-              filename=$(basename "$filepath")
               # Extract NUM_GPUS from the test file, default to 8
               NGPU=$(grep -oP '^NUM_GPUS\s*=\s*\K\d+' "$filepath" | head -1)
               NGPU=${NGPU:-8}
               if [ "$FIRST" = true ]; then FIRST=false; else MATRIX+=","; fi
-              MATRIX+="{\"test_file\":\"$filename\",\"num_gpus\":$NGPU}"
+              MATRIX+="{\"test_file\":\"$filepath\",\"num_gpus\":$NGPU}"
             done
             MATRIX+="]"
             echo "has_tests=true" >> $GITHUB_OUTPUT
@@ -234,4 +270,13 @@ jobs:
 
       - name: Execute
         shell: bash
-        run: python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- python tests/${{ matrix.info.test_file }}
+        run: |
+          TEST_PATH="${{ matrix.info.test_file }}"
+          if [[ "$TEST_PATH" != tests/* ]]; then
+            TEST_PATH="tests/$TEST_PATH"
+          fi
+          if [ "${{ matrix.info.num_gpus }}" = "0" ]; then
+            python "$TEST_PATH"
+          else
+            python tests/ci/gpu_lock_exec.py --count ${{ matrix.info.num_gpus }} -- python "$TEST_PATH"
+          fi

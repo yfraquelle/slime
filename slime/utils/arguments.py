@@ -760,6 +760,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--critic-load", type=str, default=None, help="The checkpoint for critic model.")
             parser.add_argument("--critic-save", type=str, default=None, help="The checkpoint for critic model.")
             parser.add_argument("--critic-lr", type=float, default=None, help="The lr for critic model")
+            parser.add_argument("--critic-train-only", action="store_true", default=False, help="Only train critic")
             parser.add_argument(
                 "--critic-lr-warmup-iters",
                 type=int,
@@ -1361,15 +1362,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             return parser
 
-        def add_prefill_decode_disaggregation_arguments(parser):
-            parser.add_argument(
-                "--prefill-num-servers",
-                type=int,
-                default=None,
-                help="Number of prefill servers for disaggregation.",
-            )
-            return parser
-
         def add_ci_arguments(parser):
             parser.add_argument(
                 "--ci-test",
@@ -1411,7 +1403,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
-        parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         reset_arg(
@@ -1436,7 +1427,7 @@ def _pre_parse_mode():
     the final ``args`` after Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
+    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -1459,25 +1450,16 @@ def parse_args(add_custom_arguments=None):
     if not skip_sglang:
         sglang_ns = sglang_parse_args()
 
-    # Phase 2: Parse megatron/fsdp + slime args.
+    # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
-    # are silently ignored by the megatron/fsdp parser.
-    if pre.train_backend == "megatron":
-        from slime.backends.megatron_utils.arguments import megatron_parse_args
-        from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
+    # are silently ignored by the megatron parser.
+    from slime.backends.megatron_utils.arguments import megatron_parse_args
+    from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
-        args = megatron_parse_args(
-            extra_args_provider=add_slime_arguments,
-            skip_hf_validate=pre.debug_rollout_only,
-        )
-    else:
-        logger.warning(
-            "🚧 🚧 🚧 FSDP backend is being rewritten, please use Megatron backend for better stability. 🚧 🚧 🚧"
-        )
-
-        from slime.backends.fsdp_utils.arguments import fsdp_parse_args
-
-        args = fsdp_parse_args(extra_args_provider=add_slime_arguments, ignore_unknown_args=True)
+    args = megatron_parse_args(
+        extra_args_provider=add_slime_arguments,
+        skip_hf_validate=pre.debug_rollout_only,
+    )
 
     # Merge pre-parsed args into the main namespace
     for key, value in vars(pre).items():
@@ -1782,10 +1764,6 @@ def slime_validate_args(args):
         assert (
             args.rollout_max_prompt_len <= args.rollout_max_context_len - 1
         ), f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
-
-    assert not (
-        args.prefill_num_servers is not None and args.rollout_external
-    ), "prefill_num_servers cannot be set when rollout_external is set."
 
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."

@@ -32,9 +32,28 @@ from slime.utils.types import Sample
 
 from .rm_hub import async_rm, batched_async_rm
 
-__all__ = ["generate_rollout"]
+__all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+
+def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
+    """Return the router URL for a named model.
+
+    Use this in custom rollout functions to route requests to a specific
+    model when multiple models are deployed via ``--sglang-config``::
+
+        url = get_model_url(args, "ref", "/generate")
+        resp = await post(url, json=payload)
+
+    Falls back to the default router if *model_name* is not found or
+    ``sglang_model_routers`` is not set.
+    """
+    routers = getattr(args, "sglang_model_routers", None)
+    if routers and model_name in routers:
+        ip, port = routers[model_name]
+        return f"http://{ip}:{port}{endpoint}"
+    return f"http://{args.sglang_router_ip}:{args.sglang_router_port}{endpoint}"
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -118,7 +137,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
 
-    if state.processor:
+    if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
         processor_kwargs = build_processor_kwargs(sample.multimodal_inputs)
         processor_output = state.processor(text=sample.prompt, **processor_kwargs)
         prompt_ids = processor_output["input_ids"][0]
@@ -320,7 +339,11 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         urls = [worker["url"] for worker in response["workers"]]
 
     logger.info(f"Abort request for {urls}")
-    await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
 
     # make sure all the pending tasks are finished
     count = 0
