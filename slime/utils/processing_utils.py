@@ -1,7 +1,7 @@
 import base64
 import io
 import logging
-
+import copy
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
 logger = logging.getLogger(__name__)
@@ -47,16 +47,24 @@ def load_processor(name_or_path: str, **kwargs):
     return proc
 
 
-def process_vision_info(prompt, processor):
+def process_vision_info(session_id, prompt, processor):
     # TODO: temporary solution, will write image utils for slime later
-    from qwen_vl_utils import process_vision_info as qwen_process_vision_info
+    from qwen_vl_utils import process_vision_info as qwen_process_vision_info, extract_vision_info
 
     if hasattr(processor.image_processor, "patch_size"):
         image_patch_size = processor.image_processor.patch_size
     else:
         logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
         image_patch_size = DEFAULT_PATCH_SIZE
-    images, videos = qwen_process_vision_info(prompt, image_patch_size=image_patch_size)
+    processed_messages = copy.deepcopy(prompt)
+    for message in processed_messages:
+        # logger.info(f"{session_id}: message: {message}")
+        if isinstance(message['content'], list):
+            for unit in message['content']:
+                if 'url' in unit:
+                    unit['image_url']=unit['url']
+    
+    images, videos = qwen_process_vision_info(processed_messages, image_patch_size=image_patch_size)
     multimodal_inputs = {"images": images, "videos": videos}
     return multimodal_inputs
 
