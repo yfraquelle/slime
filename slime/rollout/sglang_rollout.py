@@ -70,6 +70,16 @@ class GenerateState(metaclass=SingletonMeta):
         self.semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
+        # gpu_semaphore: limits concurrent GPU inference requests (held only during LLM calls)
+        self.gpu_semaphore = asyncio.Semaphore(
+            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        )
+        # sample_semaphore: limits total active samples to prevent memory explosion
+        # (held for entire agent lifecycle, but does NOT block GPU)
+        _sem_value = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self.sample_semaphore = asyncio.Semaphore(
+            getattr(args, 'max_concurrent_samples', _sem_value * 2)
+        )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -245,7 +255,10 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
+    # sample_semaphore limits total active samples (memory bound).
+    # gpu_semaphore is applied at a finer granularity inside the agent's _stream_think()
+    # so that tool execution does not block other samples from submitting GPU requests.
+    async with state.sample_semaphore:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample
