@@ -144,7 +144,9 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
         process.join()
 
 
-_http_client: httpx.AsyncClient | None = None
+# Per-event-loop HTTP clients to avoid "bound to a different event loop" errors.
+# Each event loop gets its own httpx.AsyncClient instance, created lazily.
+_http_clients: dict[int, httpx.AsyncClient] = {}
 _client_concurrency: int = 0
 
 # Optional Ray-based distributed POST dispatch
@@ -162,7 +164,10 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60, headers=None):
+async def _post_with_client(
+    client: httpx.AsyncClient, url: str, payload: dict | None, max_retries: int = 60, headers: dict | None = None,
+):
+    """POST using an explicit client (used by Ray distributed actors with their own client)."""
     retry_count = 0
     while retry_count < max_retries:
         response = None
@@ -182,7 +187,6 @@ async def _post(client, url, payload, max_retries=60, headers=None):
 
             if isinstance(e, httpx.HTTPStatusError):
                 response_text = e.response.text
-                # Do not retry for 400 Client Error (e.g. context length exceeded)
                 if e.response.status_code == 400 and "context length" in e.response.text:
                     logger.error(f"over context length error: {response_text}, failing immediately.")
                     raise e
@@ -205,18 +209,38 @@ async def _post(client, url, payload, max_retries=60, headers=None):
     return output
 
 
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create an httpx.AsyncClient bound to the current event loop.
+
+    Each event loop gets its own client to avoid 'bound to a different event loop' errors
+    when AsyncLoopThread uses a separate loop from the main thread.
+    """
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if loop_id not in _http_clients:
+        concurrency = _client_concurrency or 100
+        _http_clients[loop_id] = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=concurrency,
+                max_keepalive_connections=concurrency,
+            ),
+            timeout=httpx.Timeout(timeout=300, connect=10),
+        )
+    return _http_clients[loop_id]
+
+
+async def _post(url: str, payload: dict | None, max_retries: int = 60, headers: dict | None = None):
+    client = await _get_http_client()
+    return await _post_with_client(client, url, payload, max_retries, headers=headers)
+
+
 def init_http_client(args):
-    """Initialize HTTP client and optionally enable distributed POST via Ray."""
-    global _http_client, _client_concurrency, _distributed_post_enabled
+    """Initialize HTTP client config and optionally enable distributed POST via Ray."""
+    global _client_concurrency, _distributed_post_enabled
     if not args.rollout_num_gpus:
         return
 
     _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
-        )
 
     # Optionally initialize distributed POST via Ray without changing interfaces
     if args.use_distributed_post:
@@ -253,7 +277,7 @@ def _init_ray_distributed_post(args):
             )
 
         async def do_post(self, url, payload, max_retries=60, headers=None):
-            return await _post(self._client, url, payload, max_retries, headers=headers)
+            return await _post_with_client(self._client, url, payload, max_retries, headers=headers)
 
     # Create actors per node
     created = []
@@ -292,11 +316,12 @@ async def post(url, payload, max_retries=60, headers=None):
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries, headers=headers)
+    return await _post(url, payload, max_retries, headers=headers)
 
 
 async def get(url):
-    response = await _http_client.get(url)
+    client = await _get_http_client()
+    response = await client.get(url)
     response.raise_for_status()
     content = await response.aread()
     output = json.loads(content)
