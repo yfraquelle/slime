@@ -88,6 +88,10 @@ def get_model_provider_func(
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
+        provider.calculate_per_token_loss = args.calculate_per_token_loss
+        provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+        provider.freeze_language_model = False
+        provider.freeze_vision_model = False
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
         provider.expert_model_parallel_size = args.expert_model_parallel_size
