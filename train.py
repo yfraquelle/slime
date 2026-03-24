@@ -1,9 +1,29 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+
+logger = logging.getLogger(__name__)
+
+
+def _is_fresh_bridge_colocate_start(args) -> bool:
+    return args.colocate and args.megatron_to_hf_mode == "bridge" and args.start_rollout_id == 0
+
+
+def _can_skip_initial_weight_sync(args) -> bool:
+    # On a fresh bridge+colocate start both Megatron and SGLang already load
+    # the same HF checkpoint, so the first full sync only burns startup time.
+    return _is_fresh_bridge_colocate_start(args) and not args.check_weight_update_equal
+
+
+def _can_skip_initial_rollout_kv_resume(args) -> bool:
+    # Rollout 0 has not generated anything yet, so there is no KV/cache graph state to restore.
+    return _is_fresh_bridge_colocate_start(args)
 
 
 def train(args):
@@ -22,15 +42,25 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_weights.remote())
 
-    # always update weight first so that sglang has the loaded weights from training.
+    # Fresh bridge+colocate runs already boot SGLang from the same HF checkpoint.
+    # Skipping the first sync avoids a redundant full-model transfer before rollout 0.
     if not args.critic_train_only:
-        actor_model.update_weights()
+        if _can_skip_initial_weight_sync(args):
+            logger.info(
+                "Skip initial weight sync for fresh bridge+colocate start because rollout engines already use %s",
+                args.hf_checkpoint,
+            )
+        else:
+            actor_model.update_weights()
 
-        if args.check_weight_update_equal:
-            ray.get(rollout_manager.check_weights.remote(action="compare"))
+            if args.check_weight_update_equal:
+                ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     if args.offload_rollout:
-        ray.get(rollout_manager.onload_kv.remote())
+        if _can_skip_initial_rollout_kv_resume(args):
+            logger.info("Skip initial rollout KV/CUDA graph resume for fresh bridge+colocate start before rollout 0")
+        else:
+            ray.get(rollout_manager.onload_kv.remote())
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:

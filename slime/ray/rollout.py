@@ -323,19 +323,32 @@ class RolloutServer:
             handles.extend(g.onload(tags))
         return ray.get(handles) if handles else []
 
+    def _should_reload_updatable_weights_from_disk(self) -> bool:
+        if not self.update_weights or not self.server_groups:
+            return False
+
+        args = self.server_groups[0].args
+        # Bridge+colocate already has the base HF checkpoint on disk, and disk reload
+        # avoids the fragile weight-resume path before training overwrites the weights.
+        return args.colocate and args.megatron_to_hf_mode == "bridge"
+
     def onload_weights(self):
         """Restore weights for offloaded groups.
 
-        All groups resume from CPU cache via ``resume_memory_occupation``.
-        For updatable servers, weights will be overwritten by
-        ``update_weights`` shortly after.  For non-updatable servers the
-        CPU backup already contains the correct (unchanged) weights.
+        Bridge+colocate updatable servers reload the base checkpoint from disk
+        before ``update_weights`` overwrites it, avoiding large CPU-backup
+        ``resume_memory_occupation`` allocations. Other servers keep the
+        original CPU-backup resume path.
         """
         handles = []
+        use_disk_reload = self._should_reload_updatable_weights_from_disk()
         for g in self.server_groups:
             if not g.needs_offload:
                 continue
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+            if use_disk_reload:
+                handles.extend(g.onload_weights_from_disk())
+            else:
+                handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
         return ray.get(handles) if handles else []
 
     def onload_kv(self):
