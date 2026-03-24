@@ -29,6 +29,7 @@ _MAX_IPC_BUCKET_BYTES = 128 * 1024**2
 _CPU_BUCKET_PREFIX = "slime_cpu_flattened_bucket:"
 _CPU_TENSOR_CHUNK_PREFIX = "slime_cpu_tensor_chunk:"
 _MAX_CPU_TENSOR_CHUNK_BYTES = 32 * 1024**2
+_CUDA_IPC_DISABLED_FOR_COLOCATE = False
 
 
 class UpdateWeightFromTensor:
@@ -199,6 +200,7 @@ class UpdateWeightFromTensor:
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             weight_version=self.weight_version,
+            identical_payload_across_group=self.args.megatron_to_hf_mode == "bridge",
         )
         all_refs.extend(refs_colocated)
 
@@ -223,11 +225,21 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
+    identical_payload_across_group: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
     if ipc_gather_group is None:
         return [], None
+
+    if identical_payload_across_group:
+        return _send_identical_payload_to_colocated_engine(
+            hf_named_tensors,
+            ipc_engine=ipc_engine,
+            ipc_gather_src=ipc_gather_src,
+            ipc_gather_group=ipc_gather_group,
+            weight_version=weight_version,
+        )
 
     long_live_tensors = []
 
@@ -269,6 +281,48 @@ def _send_to_colocated_engine(
     return refs, long_live_tensors
 
 
+def _send_identical_payload_to_colocated_engine(
+    hf_named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    ipc_engine,
+    ipc_gather_src,
+    ipc_gather_group,
+    weight_version,
+) -> tuple[list[ObjectRef], Any]:
+    if dist.get_rank() != ipc_gather_src:
+        return [], None
+
+    serialized_tensors = []
+    long_live_tensors = []
+    for named_tensors in _iter_ipc_named_tensor_buckets(
+        hf_named_tensors,
+        max_bucket_bytes=_MAX_IPC_BUCKET_BYTES,
+    ):
+        serialized_buckets, long_lived_tensor = _serialize_flattened_tensor_bucket(
+            named_tensors,
+            max_cpu_tensor_chunk_bytes=_MAX_CPU_TENSOR_CHUNK_BYTES,
+        )
+        if long_lived_tensor is not None:
+            long_live_tensors.append(long_lived_tensor)
+        serialized_tensors.extend(serialized_buckets)
+
+    # Bridge export already materializes full HF tensors on every training rank,
+    # so in colocate mode per-rank payloads are identical. Reuse the source rank
+    # payload for every engine worker instead of serializing the same tensor on
+    # all local ranks again.
+    engine_group_size = dist.get_world_size(ipc_gather_group)
+    refs = []
+    for serialized_tensor in serialized_tensors:
+        kwargs = {
+            "serialized_named_tensors": [serialized_tensor] * engine_group_size,
+            "load_format": "flattened_bucket",
+            "weight_version": str(weight_version),
+        }
+        refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
+
+    return refs, long_live_tensors
+
+
 def _iter_ipc_named_tensor_buckets(
     named_tensors: list[tuple[str, torch.Tensor]],
     *,
@@ -303,6 +357,8 @@ def _serialize_flattened_tensor_bucket(
     *,
     max_cpu_tensor_chunk_bytes: int,
 ):
+    global _CUDA_IPC_DISABLED_FOR_COLOCATE
+
     flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
     metadata = flattened_tensor_bucket.get_metadata()
     flattened_tensor = flattened_tensor_bucket.get_flattened_tensor().detach().contiguous()
@@ -311,6 +367,14 @@ def _serialize_flattened_tensor_bucket(
         "metadata": metadata,
     }
 
+    if flattened_tensor.is_cuda and _CUDA_IPC_DISABLED_FOR_COLOCATE:
+        return _serialize_cpu_fallback_bucket(
+            named_tensors=named_tensors,
+            flattened_tensor=flattened_tensor,
+            metadata=metadata,
+            max_cpu_tensor_chunk_bytes=max_cpu_tensor_chunk_bytes,
+        )
+
     try:
         serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
         return [serialized], flattened_tensor_data if flattened_tensor.is_cuda else None
@@ -318,8 +382,36 @@ def _serialize_flattened_tensor_bucket(
         if not flattened_tensor.is_cuda:
             raise
 
-        first_name = named_tensors[0][0]
-        total_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in named_tensors)
+        _CUDA_IPC_DISABLED_FOR_COLOCATE = True
+        logger.warning(
+            "Disabling CUDA IPC for subsequent colocate weight buckets after serialization failure. "
+            "reason=%r",
+            exc,
+        )
+
+        return _serialize_cpu_fallback_bucket(
+            named_tensors=named_tensors,
+            flattened_tensor=flattened_tensor,
+            metadata=metadata,
+            max_cpu_tensor_chunk_bytes=max_cpu_tensor_chunk_bytes,
+            exc=exc,
+        )
+
+
+def _serialize_cpu_fallback_bucket(
+    *,
+    named_tensors: list[tuple[str, torch.Tensor]],
+    flattened_tensor: torch.Tensor,
+    metadata,
+    max_cpu_tensor_chunk_bytes: int,
+    exc: Exception | None = None,
+):
+    if not flattened_tensor.is_cuda:
+        raise RuntimeError("CPU fallback should only be used for CUDA flattened tensors")
+
+    first_name = named_tensors[0][0]
+    total_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in named_tensors)
+    if exc is not None:
         logger.warning(
             "Falling back to CPU serialization for colocate weight bucket. "
             "first_name=%s tensor_count=%d total_bytes=%d reason=%r",
@@ -328,27 +420,28 @@ def _serialize_flattened_tensor_bucket(
             total_bytes,
             exc,
         )
-        cpu_flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor.cpu(),
-            "metadata": metadata,
-        }
-        if len(named_tensors) == 1 and total_bytes > max_cpu_tensor_chunk_bytes:
-            logger.warning(
-                "Chunking oversized CPU weight payload for colocate sync. "
-                "name=%s total_bytes=%d chunk_bytes=%d",
-                first_name,
-                total_bytes,
-                max_cpu_tensor_chunk_bytes,
-            )
-            serialized = _serialize_cpu_tensor_chunks(
-                name=first_name,
-                tensor=named_tensors[0][1].detach().cpu(),
-                max_chunk_bytes=max_cpu_tensor_chunk_bytes,
-            )
-            return serialized, None
 
-        serialized = _serialize_cpu_flattened_tensor_bucket(cpu_flattened_tensor_data)
-        return [serialized], None
+    cpu_flattened_tensor_data = {
+        "flattened_tensor": flattened_tensor.cpu(),
+        "metadata": metadata,
+    }
+    if len(named_tensors) == 1 and total_bytes > max_cpu_tensor_chunk_bytes:
+        logger.warning(
+            "Chunking oversized CPU weight payload for colocate sync. "
+            "name=%s total_bytes=%d chunk_bytes=%d",
+            first_name,
+            total_bytes,
+            max_cpu_tensor_chunk_bytes,
+        )
+        serialized = _serialize_cpu_tensor_chunks(
+            name=first_name,
+            tensor=named_tensors[0][1].detach().cpu(),
+            max_chunk_bytes=max_cpu_tensor_chunk_bytes,
+        )
+        return serialized, None
+
+    serialized = _serialize_cpu_flattened_tensor_bucket(cpu_flattened_tensor_data)
+    return [serialized], None
 
 
 def _serialize_cpu_flattened_tensor_bucket(flattened_tensor_data: dict[str, Any]) -> str:
