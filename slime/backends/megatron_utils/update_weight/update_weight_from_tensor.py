@@ -1,3 +1,6 @@
+import base64
+import logging
+import pickle
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -19,6 +22,13 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+
+logger = logging.getLogger(__name__)
+
+_MAX_IPC_BUCKET_BYTES = 128 * 1024**2
+_CPU_BUCKET_PREFIX = "slime_cpu_flattened_bucket:"
+_CPU_TENSOR_CHUNK_PREFIX = "slime_cpu_tensor_chunk:"
+_MAX_CPU_TENSOR_CHUNK_BYTES = 32 * 1024**2
 
 
 class UpdateWeightFromTensor:
@@ -221,26 +231,18 @@ def _send_to_colocated_engine(
 
     long_live_tensors = []
 
-    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
-    else:
-        converted_named_tensors_by_dtypes = {}
-        for name, tensor in hf_named_tensors:
-            dtype = tensor.dtype
-            if dtype not in converted_named_tensors_by_dtypes:
-                converted_named_tensors_by_dtypes[dtype] = []
-            converted_named_tensors_by_dtypes[dtype].append((name, tensor))
-
     serialized_tensors = []
-    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+    for named_tensors in _iter_ipc_named_tensor_buckets(
+        hf_named_tensors,
+        max_bucket_bytes=_MAX_IPC_BUCKET_BYTES,
+    ):
+        serialized_buckets, long_lived_tensor = _serialize_flattened_tensor_bucket(
+            named_tensors,
+            max_cpu_tensor_chunk_bytes=_MAX_CPU_TENSOR_CHUNK_BYTES,
+        )
+        if long_lived_tensor is not None:
+            long_live_tensors.append(long_lived_tensor)
+        serialized_tensors.extend(serialized_buckets)
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -265,3 +267,125 @@ def _send_to_colocated_engine(
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _iter_ipc_named_tensor_buckets(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    max_bucket_bytes: int,
+):
+    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+        grouped_named_tensors = [named_tensors]
+    else:
+        tensors_by_dtype = {}
+        for name, tensor in named_tensors:
+            tensors_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
+        grouped_named_tensors = tensors_by_dtype.values()
+
+    for same_group_named_tensors in grouped_named_tensors:
+        current_bucket = []
+        current_bucket_bytes = 0
+        for name, tensor in same_group_named_tensors:
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if current_bucket and current_bucket_bytes + tensor_bytes > max_bucket_bytes:
+                yield current_bucket
+                current_bucket = []
+                current_bucket_bytes = 0
+            current_bucket.append((name, tensor))
+            current_bucket_bytes += tensor_bytes
+
+        if current_bucket:
+            yield current_bucket
+
+
+def _serialize_flattened_tensor_bucket(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    max_cpu_tensor_chunk_bytes: int,
+):
+    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+    metadata = flattened_tensor_bucket.get_metadata()
+    flattened_tensor = flattened_tensor_bucket.get_flattened_tensor().detach().contiguous()
+    flattened_tensor_data = {
+        "flattened_tensor": flattened_tensor,
+        "metadata": metadata,
+    }
+
+    try:
+        serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+        return [serialized], flattened_tensor_data if flattened_tensor.is_cuda else None
+    except Exception as exc:
+        if not flattened_tensor.is_cuda:
+            raise
+
+        first_name = named_tensors[0][0]
+        total_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in named_tensors)
+        logger.warning(
+            "Falling back to CPU serialization for colocate weight bucket. "
+            "first_name=%s tensor_count=%d total_bytes=%d reason=%r",
+            first_name,
+            len(named_tensors),
+            total_bytes,
+            exc,
+        )
+        cpu_flattened_tensor_data = {
+            "flattened_tensor": flattened_tensor.cpu(),
+            "metadata": metadata,
+        }
+        if len(named_tensors) == 1 and total_bytes > max_cpu_tensor_chunk_bytes:
+            logger.warning(
+                "Chunking oversized CPU weight payload for colocate sync. "
+                "name=%s total_bytes=%d chunk_bytes=%d",
+                first_name,
+                total_bytes,
+                max_cpu_tensor_chunk_bytes,
+            )
+            serialized = _serialize_cpu_tensor_chunks(
+                name=first_name,
+                tensor=named_tensors[0][1].detach().cpu(),
+                max_chunk_bytes=max_cpu_tensor_chunk_bytes,
+            )
+            return serialized, None
+
+        serialized = _serialize_cpu_flattened_tensor_bucket(cpu_flattened_tensor_data)
+        return [serialized], None
+
+
+def _serialize_cpu_flattened_tensor_bucket(flattened_tensor_data: dict[str, Any]) -> str:
+    cpu_flattened_tensor = flattened_tensor_data["flattened_tensor"]
+    payload = {
+        "flattened_tensor_bytes": cpu_flattened_tensor.numpy().tobytes(),
+        "metadata": flattened_tensor_data["metadata"],
+    }
+    serialized_payload = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    return _CPU_BUCKET_PREFIX + base64.b64encode(serialized_payload).decode("ascii")
+
+
+def _serialize_cpu_tensor_chunks(
+    *,
+    name: str,
+    tensor: torch.Tensor,
+    max_chunk_bytes: int,
+) -> list[str]:
+    flattened_tensor = tensor.contiguous().view(torch.uint8)
+    tensor_bytes = flattened_tensor.numpy().tobytes()
+    total_bytes = len(tensor_bytes)
+    serialized_chunks = []
+
+    for chunk_start in range(0, total_bytes, max_chunk_bytes):
+        chunk_end = min(chunk_start + max_chunk_bytes, total_bytes)
+        payload = {
+            "name": name,
+            "shape": tensor.shape,
+            "dtype": tensor.dtype,
+            "total_bytes": total_bytes,
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "chunk_bytes": tensor_bytes[chunk_start:chunk_end],
+        }
+        serialized_payload = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        serialized_chunks.append(
+            _CPU_TENSOR_CHUNK_PREFIX + base64.b64encode(serialized_payload).decode("ascii")
+        )
+
+    return serialized_chunks

@@ -2,12 +2,26 @@ import logging
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
-from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
+
+try:
+    from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+except (ImportError, ModuleNotFoundError):
+    # Megatron dev moved tokenizer helpers under megatron.core.tokenizers.
+    from megatron.core.tokenizers.utils.build_tokenizer import (
+        vocab_size_with_padding as _vocab_size_with_padding,
+    )
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
+
+
+def _get_first_attr(obj, *names):
+    for name in names:
+        if hasattr(obj, name):
+            return name, getattr(obj, name)
+    return None, None
 
 
 def validate_args(args):
@@ -49,19 +63,27 @@ def _hf_validate_args(args, hf_config):
     else:
         _hf_rope_theta = getattr(hf_config, "rope_theta", None)
 
-    for hf_config_name, megatron_config_name, compare_fn in [
-        ("hidden_size", "hidden_size", equal),
-        ("num_attention_heads", "num_attention_heads", equal),
-        ("num_hidden_layers", "num_layers", equal),
-        ("intermediate_size", "ffn_hidden_size", equal),
-        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
-        ("rms_norm_eps", "norm_epsilon", equal),
+    for hf_config_name, megatron_config_names, compare_fn in [
+        ("hidden_size", ("hidden_size",), equal),
+        ("num_attention_heads", ("num_attention_heads",), equal),
+        ("num_hidden_layers", ("num_layers",), equal),
+        ("intermediate_size", ("ffn_hidden_size",), equal),
+        ("tie_word_embeddings", ("untie_embeddings_and_output_weights",), lambda x, y: not x == y),
+        ("rms_norm_eps", ("norm_epsilon", "layernorm_epsilon"), equal),
     ]:
         if hasattr(hf_config, hf_config_name):
-            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
+            megatron_config_name, megatron_value = _get_first_attr(args, *megatron_config_names)
+            if megatron_config_name is None:
+                logger.warning(
+                    "Skip hf arg validation for %s because none of %s exists in Megatron args.",
+                    hf_config_name,
+                    megatron_config_names,
+                )
+                continue
+            if not compare_fn(getattr(hf_config, hf_config_name), megatron_value):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+                    f"{megatron_config_name} {megatron_value}, please check the config."
                 )
 
     # Validate rope_theta separately using the resolved value

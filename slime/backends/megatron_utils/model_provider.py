@@ -54,6 +54,15 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def _call_model_provider_compat(provider, **kwargs):
+    sig = inspect.signature(provider)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
+        return provider(**kwargs)
+
+    filtered_kwargs = {name: value for name, value in kwargs.items() if name in sig.parameters}
+    return provider(**filtered_kwargs)
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -62,15 +71,19 @@ def get_model_provider_func(
     if getattr(args, "custom_model_provider_path", None):
 
         def wrapped_model_provider(
-            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None
+            pre_process: bool = True,
+            post_process: bool = True,
+            vp_stage: int | None = None,
+            **kwargs,
         ) -> GPTModel:
             custom_model_provider = load_function(args.custom_model_provider_path)
-            # Check if the custom provider supports vp_stage parameter
-            has_vp_stage = "vp_stage" in inspect.signature(custom_model_provider).parameters
-            if has_vp_stage:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-            else:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            model = _call_model_provider_compat(
+                custom_model_provider,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=vp_stage,
+                **kwargs,
+            )
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
@@ -110,8 +123,14 @@ def get_model_provider_func(
         if role == "critic":
             _original_provide = provider.provide
 
-            def _critic_provide(pre_process=True, post_process=True, vp_stage=None):
-                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            def _critic_provide(pre_process=True, post_process=True, vp_stage=None, **kwargs):
+                model = _call_model_provider_compat(
+                    _original_provide,
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    vp_stage=vp_stage,
+                    **kwargs,
+                )
                 if post_process:
                     model.output_layer = LinearForLastLayer(
                         input_size=model.config.hidden_size, output_size=1, config=model.config
@@ -233,12 +252,14 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
-        sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
+        model = _call_model_provider_compat(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
+        )
 
         freeze_model_params(model, args)
 
