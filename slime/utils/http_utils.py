@@ -144,8 +144,8 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
         process.join()
 
 
-# Per-event-loop HTTP clients to avoid "bound to a different event loop" errors.
-# Each event loop gets its own httpx.AsyncClient instance, created lazily.
+# Per-event-loop HTTP clients avoid "bound to a different event loop" errors
+# when requests are issued from both the main thread and AsyncLoopThread.
 _http_clients: dict[int, httpx.AsyncClient] = {}
 _client_concurrency: int = 0
 
@@ -162,6 +162,18 @@ def _next_actor():
     actor = _post_actors[_post_actor_idx % len(_post_actors)]
     _post_actor_idx = (_post_actor_idx + 1) % len(_post_actors)
     return actor
+
+
+def _create_http_client(concurrency: int) -> httpx.AsyncClient:
+    normalized_concurrency = max(1, concurrency)
+    return httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=normalized_concurrency,
+            max_keepalive_connections=normalized_concurrency,
+        ),
+        timeout=httpx.Timeout(None),
+        trust_env=False,  # internal SGLang comm only; never route through system proxy
+    )
 
 
 async def _post_with_client(
@@ -218,14 +230,7 @@ async def _get_http_client() -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
     loop_id = id(loop)
     if loop_id not in _http_clients:
-        concurrency = _client_concurrency or 100
-        _http_clients[loop_id] = httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_connections=concurrency,
-                max_keepalive_connections=concurrency,
-            ),
-            timeout=httpx.Timeout(timeout=300, connect=10),
-        )
+        _http_clients[loop_id] = _create_http_client(_client_concurrency or 100)
     return _http_clients[loop_id]
 
 
@@ -271,10 +276,7 @@ def _init_ray_distributed_post(args):
     class _HttpPosterActor:
         def __init__(self, concurrency: int):
             # Lazy creation to this actor's event loop
-            self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(None),
-            )
+            self._client = _create_http_client(concurrency)
 
         async def do_post(self, url, payload, max_retries=60, headers=None):
             return await _post_with_client(self._client, url, payload, max_retries, headers=headers)
