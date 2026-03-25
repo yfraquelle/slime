@@ -131,8 +131,8 @@ def get_responses(
             logits_1 = logits_1[logits_offset[1][0] - chunks_offset[1][0] : logits_offset[1][1] - chunks_offset[1][0]]
             tokens_1 = tokens[tokens_offset[1][0] : tokens_offset[1][1]]
 
-            assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
-            assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
+            assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}\nlogits: {logits.shape}, tokens: {tokens.shape},\n{chunk_size=} {chunks_offset=} {logits_offset=} {tokens_offset=}"
+            assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}\nlogits: {logits.shape}, tokens: {tokens.shape},\n{chunk_size=} {chunks_offset=} {logits_offset=} {tokens_offset=}"
 
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
@@ -666,15 +666,27 @@ def policy_loss_function(
     full_old_log_probs = None
     if need_full_log_probs:
         full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(
-                log_probs, total_lengths, response_lengths, strict=False
+            all_gather_with_cp(
+                log_prob,
+                total_length,
+                response_length,
+                args.qkv_format,
+                max_seq_lens[i] if max_seq_lens is not None else None,
+            )
+            for i, (log_prob, total_length, response_length) in enumerate(
+                zip(log_probs, total_lengths, response_lengths, strict=False)
             )
         ]
         full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
-            for old_log_prob, total_length, response_length in zip(
-                old_log_probs, total_lengths, response_lengths, strict=False
+            all_gather_with_cp(
+                old_log_prob,
+                total_length,
+                response_length,
+                args.qkv_format,
+                max_seq_lens[i] if max_seq_lens is not None else None,
+            )
+            for i, (old_log_prob, total_length, response_length) in enumerate(
+                zip(old_log_probs, total_lengths, response_lengths, strict=False)
             )
         ]
 
