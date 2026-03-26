@@ -214,7 +214,7 @@ def get_batch(
         print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
                 f"Active(Loss Mask 1)={active_tokens}, "
                 f"RawLengths={raw_seq_lens}")
-    batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
+    # batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
     # print(f"[Rank {rank}] get_batch processed batch shapes: {batch_shapes}")
     return batch
 
