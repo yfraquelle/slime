@@ -656,6 +656,10 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
     if logits.size(0) != 0:
         if chunk_size > 0:
             num_chunks = (logits.size(0) - 1) // chunk_size + 1
+            # print(
+            #     f"log_probs_entropy: logits size={logits.size()}, "
+            #     f"chunk_size={chunk_size}, num_chunks={num_chunks}"
+            # )
             tokens_chunks = tokens.chunk(num_chunks, dim=0)
             logits_chunks = logits.chunk(num_chunks, dim=0)
             log_probs = []
