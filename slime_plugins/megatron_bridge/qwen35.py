@@ -14,6 +14,9 @@ import torch.distributed as dist
 import torch.distributed.nn
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import (
+    Qwen3VLTransformerConfig,
+)
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     AllGatherVisionEmbeddings,
     collapse_thw,
@@ -39,6 +42,10 @@ from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
 from megatron.core import InferenceParams, mpu, tensor_parallel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
+
+
+if not hasattr(Qwen3VLTransformerConfig, "batch_invariant_mode"):
+    Qwen3VLTransformerConfig.batch_invariant_mode = False
 
 
 def _patched_expert_down_proj_hf_to_megatron(
