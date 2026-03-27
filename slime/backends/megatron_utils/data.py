@@ -210,7 +210,7 @@ def get_batch(
     raw_seq_lens = [t.size(0) for t in batch["unconcat_tokens"]]
     
     # 为了避免 Log 刷屏，可以每隔几十个 Step 打印一次
-    if total_tokens>2048*4:
+    if total_tokens>2048*2:
         print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
                 f"Active(Loss Mask 1)={active_tokens}, "
                 f"RawLengths={raw_seq_lens}")

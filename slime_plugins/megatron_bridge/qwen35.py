@@ -8,8 +8,6 @@ vision/text alignment issue under BSHD + context parallelism.
 
 from __future__ import annotations
 
-import copy
-import os
 from types import MethodType
 import torch
 import torch.distributed as dist
@@ -20,7 +18,6 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     AllGatherVisionEmbeddings,
     collapse_thw,
     get_vision_cp_data,
-    preprocess_packed_seqs,
     qwen3vl_cp_split,
     reorganize_inputs,
     split_deepstack_embs,
@@ -32,7 +29,6 @@ from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
     Qwen3VLSelfAttention,
     _patch_standard_attention_specs,
 )
-from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLBridge, Qwen35VLMoEBridge
 from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
     ExpertMLPDownProjMapping,
     ExpertMLPGateUpProjMapping,
@@ -40,23 +36,9 @@ from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
     extract_expert_number_from_param,
     get_module_and_param_from_name,
 )
-from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
 from megatron.core import InferenceParams, mpu, tensor_parallel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-
-from slime_plugins.models.hf_attention import _AllGatherForDuplicatedComputation
-from slime_plugins.models.qwen3_5 import Qwen3_5GatedDeltaNet
-
-
-def _use_slime_gdn() -> bool:
-    value = os.getenv("SLIME_QWEN35_VL_GDN_IMPL", "megatron").strip().lower()
-    return value not in {"native", "mcore", "megatron"}
 
 
 def _patched_expert_down_proj_hf_to_megatron(
@@ -112,174 +94,6 @@ def _patched_expert_gate_up_hf_to_megatron(
 
 ExpertMLPDownProjMapping.hf_to_megatron = _patched_expert_down_proj_hf_to_megatron
 ExpertMLPGateUpProjMapping.hf_to_megatron = _patched_expert_gate_up_hf_to_megatron
-
-
-class SlimeQwen35VLLinearAttention(MegatronModule):
-    """Bridge-side replacement for Qwen3.5 linear attention layers.
-
-    This keeps Megatron-Bridge for the rest of the model, but routes linear-attention
-    layers through slime's duplicated-compute GDN implementation so we do not depend
-    on MCore's native GatedDeltaNet TP*CP head divisibility constraints.
-    """
-
-    def __init__(
-        self,
-        config,
-        layer_number: int,
-        text_config,
-        cp_comm_type: str = "p2p",
-        pg_collection=None,
-    ):
-        del cp_comm_type, pg_collection
-        super().__init__(config=config)
-        self.config = config
-        self.layer_number = layer_number
-        self.text_config = text_config
-        self.hf_layer_idx = layer_number - 1
-
-        self.linear_attn = Qwen3_5GatedDeltaNet(self.text_config, self.hf_layer_idx)
-
-        try:
-            from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
-
-            self.input_layernorm = Qwen3NextRMSNorm(
-                self.text_config.hidden_size,
-                eps=self.text_config.rms_norm_eps,
-            )
-        except ImportError:
-            from torch.nn import RMSNorm
-
-            self.input_layernorm = RMSNorm(
-                self.text_config.hidden_size,
-                eps=self.text_config.rms_norm_eps,
-            )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        key_value_states: torch.Tensor | None = None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        rotary_pos_cos_sin=None,
-        attention_bias=None,
-        packed_seq_params: PackedSeqParams | None = None,
-        sequence_len_offset: int | None = None,
-        *,
-        inference_params=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del (
-            attention_mask,
-            key_value_states,
-            inference_context,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            rotary_pos_cos_sin,
-            attention_bias,
-            sequence_len_offset,
-            inference_params,
-        )
-        cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
-
-        if self.config.sequence_parallel:
-            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states,
-                tensor_parallel_output_grad=False,
-                group=mpu.get_tensor_model_parallel_group(),
-            )
-
-        if mpu.get_context_parallel_world_size() > 1:
-            cp_size = mpu.get_context_parallel_world_size()
-            hidden_states_list = _AllGatherForDuplicatedComputation.apply(
-                hidden_states,
-                mpu.get_context_parallel_group(),
-            )
-
-            if cu_seqlens is None:
-                local_seq_len = hidden_states.shape[0]
-                assert local_seq_len % 2 == 0, f"expected even CP local seq len, got {local_seq_len}"
-                chunk_size = local_seq_len // 2
-                hidden_states = torch.cat(
-                    [rank_hidden[:chunk_size] for rank_hidden in hidden_states_list]
-                    + [rank_hidden[chunk_size:] for rank_hidden in hidden_states_list][::-1],
-                    dim=0,
-                )
-            else:
-                whole_hidden_states_list = []
-                local_cu_seqlens = cu_seqlens // cp_size
-                for i in range(len(cu_seqlens) - 1):
-                    seqlen = cu_seqlens[i + 1] - cu_seqlens[i]
-                    chunk_size = seqlen // 2 // cp_size
-                    whole_hidden_states_list.extend(
-                        [
-                            hidden_states_list[cp_rank][local_cu_seqlens[i] : local_cu_seqlens[i] + chunk_size]
-                            for cp_rank in range(cp_size)
-                        ]
-                        + [
-                            hidden_states_list[cp_rank][local_cu_seqlens[i] + chunk_size : local_cu_seqlens[i + 1]]
-                            for cp_rank in range(cp_size)
-                        ][::-1],
-                    )
-                hidden_states = torch.cat(whole_hidden_states_list, dim=0)
-
-        hidden_states = hidden_states.permute(1, 0, 2)
-        hidden_states = self.input_layernorm(hidden_states)
-        output = self.linear_attn(
-            hidden_states=hidden_states,
-            cu_seqlens=cu_seqlens,
-        )
-        output = output.permute(1, 0, 2)
-
-        if mpu.get_context_parallel_world_size() > 1:
-            cp_size = mpu.get_context_parallel_world_size()
-            cp_rank = mpu.get_context_parallel_rank()
-            if cu_seqlens is None:
-                chunks = torch.chunk(output, 2 * cp_size, dim=0)
-                output = torch.cat([chunks[cp_rank], chunks[2 * cp_size - 1 - cp_rank]], dim=0)
-            else:
-                output_list = []
-                for i in range(len(cu_seqlens) - 1):
-                    seqlen = cu_seqlens[i + 1] - cu_seqlens[i]
-                    chunk_size = seqlen // 2 // cp_size
-                    seq = output[cu_seqlens[i] : cu_seqlens[i + 1]]
-                    chunks = torch.chunk(seq, 2 * cp_size, dim=0)
-                    output_list.append(chunks[cp_rank])
-                    output_list.append(chunks[2 * cp_size - 1 - cp_rank])
-                output = torch.cat(output_list, dim=0)
-
-        if self.config.sequence_parallel:
-            output = tensor_parallel.scatter_to_sequence_parallel_region(
-                output,
-                group=mpu.get_tensor_model_parallel_group(),
-            )
-
-        return output, None
-
-
-def _patch_linear_attention_specs(block_spec, config, vp_stage, text_config) -> None:
-    layer_types = getattr(text_config, "layer_types", None)
-    if layer_types is None:
-        interval = getattr(text_config, "full_attention_interval", 4)
-        layer_types = [
-            "full_attention" if (i + 1) % interval == 0 else "linear_attention"
-            for i in range(text_config.num_hidden_layers)
-        ]
-
-    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
-    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
-
-    for layer_id in range(num_layers_to_build):
-        if layer_types[layer_id + offset] != "linear_attention":
-            continue
-        layer_specs = copy.deepcopy(block_spec.layer_specs[layer_id])
-        layer_specs.submodules.self_attention = ModuleSpec(
-            module=SlimeQwen35VLLinearAttention,
-            params={"text_config": text_config},
-        )
-        block_spec.layer_specs[layer_id] = layer_specs
 
 
 def _gather_input_ids_from_cp_bshd(
@@ -643,11 +457,11 @@ class SlimeQwen35VLModel(Qwen3VLModel):
             combined_embeddings = self.language_model.embedding(
                 input_ids=input_ids,
                 position_ids=None,
-            ).clone()
+            )
 
             if vision_embeds is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
                 if vision_mask is not None and vision_mask.any():
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous().clone()
                     local_vision_count = int(vision_mask.sum().item())
                     embed_count = int(vision_embeds.shape[0])
                     assert local_vision_count == embed_count, (
@@ -656,7 +470,7 @@ class SlimeQwen35VLModel(Qwen3VLModel):
                         f"{tuple(input_ids.shape)=} {tuple(vision_data.shape) if vision_data is not None else None=}"
                     )
                     combined_embeddings[vision_mask] = vision_embeds
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
             if self.config.sequence_parallel:
                 combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
@@ -756,19 +570,12 @@ class SlimeQwen35VLModel(Qwen3VLModel):
 def _patched_qwen35_provide(self, pre_process=None, post_process=None, vp_stage=None) -> SlimeQwen35VLModel:
     language_transformer_config = self
     hf_vision_config = self.vision_config
-    text_config = getattr(self, "hf_text_config", None) or getattr(self, "text_config", None)
-    if text_config is None:
-        raise AttributeError(
-            f"{type(self).__name__} is missing hf_text_config/text_config; cannot patch linear_attention layers."
-        )
     block_spec = get_gpt_decoder_block_spec(
         language_transformer_config,
         vp_stage=vp_stage,
         use_transformer_engine=HAVE_TE,
     )
     _patch_standard_attention_specs(block_spec, Qwen3VLSelfAttention)
-    if _use_slime_gdn():
-        _patch_linear_attention_specs(block_spec, language_transformer_config, vp_stage, text_config)
 
     model = Qwen3VLModel(
         language_transformer_config=language_transformer_config,
@@ -791,95 +598,21 @@ def _patched_qwen35_provide(self, pre_process=None, post_process=None, vp_stage=
 
 _ORIG_QWEN35VL_FINALIZE = Qwen35VLModelProvider.finalize
 _ORIG_QWEN35VLMOE_FINALIZE = Qwen35VLMoEModelProvider.finalize
-_ORIG_QWEN35VL_MAPPING_REGISTRY = Qwen35VLBridge.mapping_registry
-_ORIG_QWEN35VLMOE_MAPPING_REGISTRY = Qwen35VLMoEBridge.mapping_registry
 
 
 def _patched_qwen35_finalize(self) -> None:
-    if _use_slime_gdn():
-        # We replace Qwen3.5 linear-attention layers with slime's duplicated-compute GDN
-        # in provide(), so the native MCore/Megatron-Bridge GatedDeltaNet path must be
-        # disabled before finalize() triggers TransformerConfig.__post_init__.
-        self.experimental_attention_variant = None
-        self.linear_attention_type = None
-        self.linear_attention_freq = None
     self.vision_dp_when_cp = True
     self.batch_invariant_mode = False
     _ORIG_QWEN35VL_FINALIZE(self)
 
 
 def _patched_qwen35_moe_finalize(self) -> None:
-    if _use_slime_gdn():
-        self.experimental_attention_variant = None
-        self.linear_attention_type = None
-        self.linear_attention_freq = None
     self.vision_dp_when_cp = True
     self.batch_invariant_mode = False
     _ORIG_QWEN35VLMOE_FINALIZE(self)
-
-
-def _slime_linear_attention_mappings() -> list:
-    return [
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.input_layernorm.weight",
-            "model.language_model.layers.*.input_layernorm.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.A_log",
-            "model.language_model.layers.*.linear_attn.A_log",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.dt_bias",
-            "model.language_model.layers.*.linear_attn.dt_bias",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.conv1d.weight",
-            "model.language_model.layers.*.linear_attn.conv1d.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.in_proj_qkv.weight",
-            "model.language_model.layers.*.linear_attn.in_proj_qkv.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.in_proj_z.weight",
-            "model.language_model.layers.*.linear_attn.in_proj_z.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.in_proj_b.weight",
-            "model.language_model.layers.*.linear_attn.in_proj_b.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.in_proj_a.weight",
-            "model.language_model.layers.*.linear_attn.in_proj_a.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.norm.weight",
-            "model.language_model.layers.*.linear_attn.norm.weight",
-        ),
-        ReplicatedMapping(
-            "language_model.decoder.layers.*.self_attention.linear_attn.out_proj.weight",
-            "model.language_model.layers.*.linear_attn.out_proj.weight",
-        ),
-    ]
-
-
-def _patched_qwen35_mapping_registry(self):
-    registry = _ORIG_QWEN35VL_MAPPING_REGISTRY(self)
-    if _use_slime_gdn():
-        return MegatronMappingRegistry(*registry.get_all_mappings(), *_slime_linear_attention_mappings())
-    return registry
-
-
-def _patched_qwen35_moe_mapping_registry(self):
-    registry = _ORIG_QWEN35VLMOE_MAPPING_REGISTRY(self)
-    if _use_slime_gdn():
-        return MegatronMappingRegistry(*registry.get_all_mappings(), *_slime_linear_attention_mappings())
-    return registry
 
 
 Qwen35VLModelProvider.finalize = _patched_qwen35_finalize
 Qwen35VLMoEModelProvider.finalize = _patched_qwen35_moe_finalize
 Qwen35VLModelProvider.provide = _patched_qwen35_provide
 Qwen35VLMoEModelProvider.provide = _patched_qwen35_provide
-Qwen35VLBridge.mapping_registry = _patched_qwen35_mapping_registry
-Qwen35VLMoEBridge.mapping_registry = _patched_qwen35_moe_mapping_registry
