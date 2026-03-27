@@ -22,6 +22,25 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
+def _describe_batch_shapes(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    if isinstance(value, np.ndarray):
+        return tuple(value.shape)
+    if isinstance(value, dict):
+        return {k: _describe_batch_shapes(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_describe_batch_shapes(v) for v in value]
+    if hasattr(value, "shape"):
+        try:
+            return tuple(value.shape)
+        except Exception:
+            return type(value).__name__
+    return value
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -52,6 +71,9 @@ def get_batch(
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
+    # rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    # batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
+    # print(f"[Rank {rank}] get_batch raw batch shapes: {batch_shapes}")
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
@@ -188,11 +210,12 @@ def get_batch(
     raw_seq_lens = [t.size(0) for t in batch["unconcat_tokens"]]
     
     # 为了避免 Log 刷屏，可以每隔几十个 Step 打印一次
-    if total_tokens>2048*4:
+    if total_tokens>2048*2:
         print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
                 f"Active(Loss Mask 1)={active_tokens}, "
                 f"RawLengths={raw_seq_lens}")
-
+    # batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
+    # print(f"[Rank {rank}] get_batch processed batch shapes: {batch_shapes}")
     return batch
 
 
