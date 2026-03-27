@@ -71,8 +71,8 @@ def get_batch(
 
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
-    batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
+    # rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    # batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
     # print(f"[Rank {rank}] get_batch raw batch shapes: {batch_shapes}")
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
