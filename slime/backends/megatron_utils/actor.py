@@ -193,24 +193,14 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
-        # TODO: this is ugly, move to somewhere else?
-        # move tokens to GPU in advance
-        rollout_data["tokens"] = [
-            torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
-        ]
-        rollout_data["loss_masks"] = [
-            torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
-        ]
+
+        rollout_data["tokens"] = [torch.tensor(t, dtype=torch.long) for t in rollout_data["tokens"]]
+        rollout_data["loss_masks"] = [torch.tensor(t, dtype=torch.int) for t in rollout_data["loss_masks"]]
         if "multimodal_train_inputs" in rollout_data:
-            # Move multimodal training tensors to GPU in advance
             rollout_data["multimodal_train_inputs"] = [
                 (
                     {
-                        key: (
-                            torch.from_numpy(v.copy()).to(device=torch.cuda.current_device())
-                            if isinstance(v, np.ndarray)
-                            else v.to(device=torch.cuda.current_device())
-                        )
+                        key: torch.from_numpy(v.copy()) if isinstance(v, np.ndarray) else v.cpu()
                         for key, v in mm_dict.items()
                     }
                     if mm_dict is not None
@@ -220,14 +210,10 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
 
         if self.args.qkv_format == "bshd":
-            # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
-            max_seq_len = max(rollout_data["total_lengths"])
-
-            # pad to reduce memory fragmentation and maybe make the computation faster
             pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
-
-            rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
+            rollout_data["max_seq_lens"] = [
+                (total_length + pad_size - 1) // pad_size * pad_size for total_length in rollout_data["total_lengths"]
+            ]
 
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
@@ -241,7 +227,6 @@ class MegatronTrainRayActor(TrainRayActor):
                         self.args.qkv_format,
                         rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
                     ),
-                    device=torch.cuda.current_device(),
                     dtype=torch.float32,
                 )
                 for i, (log_prob, total_length, response_length) in enumerate(
@@ -255,7 +240,7 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
-                torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
+                torch.from_numpy(r) if isinstance(r, np.ndarray) else r for r in rollout_data["rollout_routed_experts"]
             ]
         return rollout_data
 

@@ -61,13 +61,20 @@ def get_sum_of_sample_mean(
     """
     Calculate correct sample mean for CP
     """
+
+    def _to_x_device(mask: torch.Tensor, x_i: torch.Tensor) -> torch.Tensor:
+        if mask.device == x_i.device:
+            return mask
+        return mask.to(device=x_i.device, non_blocking=True)
+
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+                    (x_i * (_loss_mask_i := _to_x_device(loss_mask_i, x_i))).sum()
+                    / torch.clamp_min(_loss_mask_i.sum(), 1)
                     for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
                 ]
             )
@@ -75,7 +82,7 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum()
+                    (x_i * _to_x_device(loss_mask_i, x_i)).sum()
                     for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
                 ]
             )
@@ -100,7 +107,8 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
+                    (x_i * (_chunked_loss_mask := _to_x_device(chunked_loss_mask, x_i))).sum()
+                    / torch.clamp_min(_to_x_device(loss_mask, x_i).sum(), 1)
                     for x_i, chunked_loss_mask, loss_mask in zip(
                         x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
                     )
@@ -110,7 +118,7 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum()
+                    (x_i * _to_x_device(chunked_loss_mask, x_i)).sum()
                     for x_i, chunked_loss_mask in zip(
                         x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
                     )

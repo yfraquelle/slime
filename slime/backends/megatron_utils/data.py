@@ -22,6 +22,33 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
+def _to_device_tensor(value: torch.Tensor | np.ndarray | object, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    if isinstance(value, np.ndarray):
+        tensor = torch.from_numpy(value.copy())
+    elif isinstance(value, torch.Tensor):
+        tensor = value
+    else:
+        tensor = torch.tensor(value)
+
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    return tensor.to(device=torch.cuda.current_device())
+
+
+def _to_device_optional_tensor_dict(mm_dict: dict[str, torch.Tensor | np.ndarray] | None) -> dict[str, torch.Tensor] | None:
+    if mm_dict is None:
+        return None
+    return {key: _to_device_tensor(value) for key, value in mm_dict.items()}
+
+
+def _to_device_optional_tensor_list(
+    values: list[torch.Tensor | np.ndarray] | None, *, dtype: torch.dtype | None = None
+) -> list[torch.Tensor] | None:
+    if values is None:
+        return None
+    return [_to_device_tensor(value, dtype=dtype) for value in values]
+
+
 def _describe_batch_shapes(value):
     if value is None:
         return None
@@ -78,6 +105,25 @@ def get_batch(
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
+    batch["tokens"] = [_to_device_tensor(t, dtype=torch.long) for t in batch["tokens"]]
+    batch["loss_masks"] = [_to_device_tensor(t, dtype=torch.int) for t in batch["loss_masks"]]
+    if batch.get("multimodal_train_inputs") is not None:
+        batch["multimodal_train_inputs"] = [
+            _to_device_optional_tensor_dict(mm_dict) for mm_dict in batch["multimodal_train_inputs"]
+        ]
+    for float_key in [
+        "log_probs",
+        "ref_log_probs",
+        "values",
+        "advantages",
+        "returns",
+        "rollout_log_probs",
+        "teacher_log_probs",
+        "opd_reverse_kl",
+    ]:
+        if batch.get(float_key) is not None:
+            batch[float_key] = _to_device_optional_tensor_list(batch[float_key], dtype=torch.float32)
+
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
@@ -90,7 +136,14 @@ def get_batch(
     cp_rank = mpu.get_context_parallel_rank()
 
     if qkv_format == "bshd":
-        max_seqlen = batch["max_seq_lens"][0]
+        if len(tokens) == 1:
+            max_seqlen = batch["max_seq_lens"][0]
+        else:
+            # bshd dense stacking still needs one shared padded length inside the fetched micro-batch.
+            # The current colocate script uses micro-batch-size=1, so this branch preserves per-sample max_seq_len.
+            max_seqlen = max(batch["max_seq_lens"])
+            batch["max_seq_lens"] = [max_seqlen] * len(batch["max_seq_lens"])
+
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
@@ -200,20 +253,20 @@ def get_batch(
         batch["multimodal_num_items"] = multimodal_num_items
 
     # 1. 整个 Micro-batch 的总长度 (包含 Padding)
-    total_tokens = tokens.numel() 
+    # total_tokens = tokens.numel() 
     
-    # 2. 实际参与 Loss 计算的 Token 数量 (loss_mask == 1)
-    # 注意: tokens 可能经过了 CP (Context Parallel) 切分，这里统计的是当前 Rank 分担的部分
-    active_tokens = loss_masks.sum().item()
+    # # 2. 实际参与 Loss 计算的 Token 数量 (loss_mask == 1)
+    # # 注意: tokens 可能经过了 CP (Context Parallel) 切分，这里统计的是当前 Rank 分担的部分
+    # active_tokens = loss_masks.sum().item()
     
-    # 3. 如果想看原始序列长度 (不含 Padding)
-    raw_seq_lens = [t.size(0) for t in batch["unconcat_tokens"]]
+    # # 3. 如果想看原始序列长度 (不含 Padding)
+    # raw_seq_lens = [t.size(0) for t in batch["unconcat_tokens"]]
     
-    # 为了避免 Log 刷屏，可以每隔几十个 Step 打印一次
-    if total_tokens>2048*2:
-        print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
-                f"Active(Loss Mask 1)={active_tokens}, "
-                f"RawLengths={raw_seq_lens}")
+    # # 为了避免 Log 刷屏，可以每隔几十个 Step 打印一次
+    # if total_tokens>2048*2:
+    #     print(f"[Rank {dist.get_rank()}] MicroBatch: Total={total_tokens}, "
+    #             f"Active(Loss Mask 1)={active_tokens}, "
+    #             f"RawLengths={raw_seq_lens}")
     # batch_shapes = {key: _describe_batch_shapes(val) for key, val in batch.items()}
     # print(f"[Rank {rank}] get_batch processed batch shapes: {batch_shapes}")
     return batch
