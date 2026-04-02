@@ -593,12 +593,12 @@ def _patched_qwen35_provide(self, pre_process=None, post_process=None, vp_stage=
     )
     model.forward = MethodType(SlimeQwen35VLModel.forward, model)
 
-    if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
-        model.freeze(
-            freeze_language_model=self.freeze_language_model,
-            freeze_vision_model=self.freeze_vision_model,
-            freeze_vision_projection=self.freeze_vision_projection,
-        )
+    # if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
+    model.freeze(
+        freeze_language_model=False,
+        freeze_vision_model=True,
+        freeze_vision_projection=True,
+    )
 
     return model
 
