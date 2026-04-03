@@ -1,3 +1,18 @@
+From e7b5daa0a6b995c577d5fb8cbcfe20a4fde48cd1 Mon Sep 17 00:00:00 2001
+From: "yufan.yufan" <yufan.yufan@bytedance.com>
+Date: Wed, 25 Mar 2026 02:47:59 +0000
+Subject: [PATCH 1/4] cherry-pick attention at main & gdn at dev
+
+---
+ .../fine_grained_activation_offload.py        |  60 +++
+ megatron/core/ssm/gated_delta_net.py          | 457 ++++++++++++----
+ megatron/core/transformer/attention.py        | 494 +++++++++++++-----
+ megatron/core/transformer/torch_norm.py       |  14 +
+ megatron/core/typed_torch.py                  | 222 ++++++++
+ megatron/core/utils.py                        |   3 +
+ 6 files changed, 1033 insertions(+), 217 deletions(-)
+ create mode 100644 megatron/core/typed_torch.py
+
 diff --git a/megatron/core/pipeline_parallel/fine_grained_activation_offload.py b/megatron/core/pipeline_parallel/fine_grained_activation_offload.py
 index 138dcd8f7..1c6e3a9b5 100644
 --- a/megatron/core/pipeline_parallel/fine_grained_activation_offload.py
@@ -70,14 +85,13 @@ index 138dcd8f7..1c6e3a9b5 100644
  def fine_grained_offloading_group_start(tensor, name=None):
      """Mark the start of a layer group and prepare for offload/reload."""
 diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
-index dfa6e4c35..0e62801f0 100644
+index dfa6e4c35..ed9f4ff2e 100644
 --- a/megatron/core/ssm/gated_delta_net.py
 +++ b/megatron/core/ssm/gated_delta_net.py
-@@ -21,7 +21,15 @@ from megatron.core.inference.contexts import BaseInferenceContext
+@@ -21,6 +21,12 @@ from megatron.core.inference.contexts import BaseInferenceContext
  from megatron.core.jit import jit_fuser
  from megatron.core.packed_seq_params import PackedSeqParams
  from megatron.core.process_groups_config import ProcessGroupCollection
-+from megatron.core.parallel_state import get_tensor_model_parallel_rank
 +from megatron.core.ssm.mamba_context_parallel import (
 +    _all_to_all_cp2hp,
 +    _all_to_all_hp2cp,
@@ -85,11 +99,9 @@ index dfa6e4c35..0e62801f0 100644
 +    _undo_attention_load_balancing,
 +)
  from megatron.core.tensor_parallel import get_cuda_rng_tracker
-+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
  from megatron.core.transformer import TransformerConfig
  from megatron.core.transformer.identity_op import IdentityOp
- from megatron.core.transformer.module import MegatronModule
-@@ -33,24 +41,19 @@ from megatron.core.transformer.utils import (
+@@ -33,24 +39,19 @@ from megatron.core.transformer.utils import (
  )
  from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
  
@@ -117,7 +129,7 @@ index dfa6e4c35..0e62801f0 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -84,6 +87,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -84,6 +85,7 @@ class GatedDeltaNet(MegatronModule):
          use_qk_l2norm: bool = True,
          A_init_range: Tuple[float, float] = (1, 16),
          pg_collection: ProcessGroupCollection = None,
@@ -125,7 +137,7 @@ index dfa6e4c35..0e62801f0 100644
      ):
          """
          Args:
-@@ -100,7 +104,9 @@ class GatedDeltaNet(MegatronModule):
+@@ -100,7 +102,9 @@ class GatedDeltaNet(MegatronModule):
          """
  
          if not HAVE_FLA:
@@ -136,7 +148,7 @@ index dfa6e4c35..0e62801f0 100644
  
          super().__init__(config)
  
-@@ -114,6 +120,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -114,6 +118,7 @@ class GatedDeltaNet(MegatronModule):
          self.use_qk_l2norm = use_qk_l2norm
          assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
          self.pg_collection = pg_collection
@@ -144,20 +156,16 @@ index dfa6e4c35..0e62801f0 100644
          self.tp_size = self.pg_collection.tp.size()
          self.sp_size = self.tp_size if config.sequence_parallel else 1
  
-@@ -129,6 +136,12 @@ class GatedDeltaNet(MegatronModule):
+@@ -129,6 +134,8 @@ class GatedDeltaNet(MegatronModule):
          self.num_value_heads = config.linear_num_value_heads
          self.qk_dim = self.key_head_dim * self.num_key_heads
          self.v_dim = self.value_head_dim * self.num_value_heads
 +        self.qk_dim_local_tp = self.qk_dim // self.tp_size
 +        self.v_dim_local_tp = self.v_dim // self.tp_size
-+        self.gather_qk_after_conv = (
-+            self.num_key_heads % (self.tp_size * self.cp_size) != 0
-+            and (self.tp_size * self.cp_size) % self.num_key_heads == 0
-+        )
  
          # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
          # TODO: for now, output gate is forced for GDN.
-@@ -195,6 +208,11 @@ class GatedDeltaNet(MegatronModule):
+@@ -195,6 +202,11 @@ class GatedDeltaNet(MegatronModule):
          )
          setattr(self.A_log, "tensor_model_parallel", True)
  
@@ -169,7 +177,7 @@ index dfa6e4c35..0e62801f0 100644
          # Output layernorm before projection
          self.out_norm = build_module(
              submodules.out_norm,
-@@ -217,8 +235,6 @@ class GatedDeltaNet(MegatronModule):
+@@ -217,8 +229,6 @@ class GatedDeltaNet(MegatronModule):
              tp_group=self.pg_collection.tp,
          )
  
@@ -178,7 +186,7 @@ index dfa6e4c35..0e62801f0 100644
          self.reset_parameters()
  
      def reset_parameters(self):
-@@ -241,23 +257,18 @@ class GatedDeltaNet(MegatronModule):
+@@ -241,23 +251,18 @@ class GatedDeltaNet(MegatronModule):
                      dtype=self.config.params_dtype,
                      device=torch.cuda.current_device(),
                  ).uniform_(*self.A_init_range)
@@ -204,7 +212,7 @@ index dfa6e4c35..0e62801f0 100644
      ):
          """
          Perform a forward pass through the GDN module.
-@@ -265,15 +276,8 @@ class GatedDeltaNet(MegatronModule):
+@@ -265,15 +270,8 @@ class GatedDeltaNet(MegatronModule):
          Args:
              hidden_states (Tensor): Hidden states.
              attention_mask (Tensor): Attention mask.
@@ -220,7 +228,7 @@ index dfa6e4c35..0e62801f0 100644
              packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
              sequence_len_offset (Optional[int]): Sequence length offset used for
                  inference CUDA graphs.
-@@ -287,7 +291,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -287,7 +285,7 @@ class GatedDeltaNet(MegatronModule):
          inference_context = deprecate_inference_params(inference_context, inference_params)
  
          seq_len, batch, _ = hidden_states.shape
@@ -229,7 +237,7 @@ index dfa6e4c35..0e62801f0 100644
  
          if inference_context is not None:
              assert (
-@@ -306,6 +310,22 @@ class GatedDeltaNet(MegatronModule):
+@@ -306,6 +304,22 @@ class GatedDeltaNet(MegatronModule):
          qkvzba, _ = self.in_proj(hidden_states)
          nvtx_range_pop(suffix="in_proj")
  
@@ -252,7 +260,7 @@ index dfa6e4c35..0e62801f0 100644
          # Transpose: s b x --> b s x
          # From sbhd to bshd format
          qkvzba = qkvzba.transpose(0, 1)
-@@ -314,10 +334,10 @@ class GatedDeltaNet(MegatronModule):
+@@ -314,10 +328,10 @@ class GatedDeltaNet(MegatronModule):
          qkv, gate, beta, alpha = torch.split(
              qkvzba,
              [
@@ -267,7 +275,7 @@ index dfa6e4c35..0e62801f0 100644
              ],
              dim=-1,
          )
-@@ -326,74 +346,96 @@ class GatedDeltaNet(MegatronModule):
+@@ -326,74 +340,81 @@ class GatedDeltaNet(MegatronModule):
          alpha = alpha.reshape(batch, seq_len, -1)
  
          # Convolution on qkv
@@ -352,21 +360,6 @@ index dfa6e4c35..0e62801f0 100644
 -        alpha = alpha.contiguous()
 +        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
 +        nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
-+        if self.gather_qk_after_conv:
-+            q_local_dim = self.qk_dim_local_tp // self.cp_size
-+            v_local_dim = self.v_dim_local_tp // self.cp_size
-+            q_local, k_local, value_local = torch.split(
-+                qkv,
-+                [q_local_dim, q_local_dim, v_local_dim],
-+                dim=-1,
-+            )
-+            q_local = all_gather_last_dim_from_tensor_parallel_region(
-+                q_local, group=self.pg_collection.tp
-+            )
-+            k_local = all_gather_last_dim_from_tensor_parallel_region(
-+                k_local, group=self.pg_collection.tp
-+            )
-+            qkv = torch.cat([q_local, k_local, value_local], dim=-1)
 +        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
 +            qkv, gate, beta, alpha, batch, seq_len
 +        )
@@ -419,7 +412,7 @@ index dfa6e4c35..0e62801f0 100644
          nvtx_range_pop(suffix="gated_delta_rule")
  
          # RMSNorm
-@@ -406,6 +448,11 @@ class GatedDeltaNet(MegatronModule):
+@@ -406,6 +427,11 @@ class GatedDeltaNet(MegatronModule):
          norm_out = norm_out.reshape(batch, seq_len, -1)
          norm_out = norm_out.transpose(0, 1).contiguous()
  
@@ -431,7 +424,7 @@ index dfa6e4c35..0e62801f0 100644
          # Output projection
          nvtx_range_push(suffix="out_proj")
          out, out_bias = self.out_proj(norm_out)
-@@ -425,6 +472,70 @@ class GatedDeltaNet(MegatronModule):
+@@ -425,6 +451,57 @@ class GatedDeltaNet(MegatronModule):
          y = y.to(x_dtype)
          return y
  
@@ -441,12 +434,10 @@ index dfa6e4c35..0e62801f0 100644
 +        Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
 +        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
 +        """
-+        # Split qkv into query_key and value. query_key can be wider than the
-+        # local TP shard when TP slices are gathered to support tp*cp > num_key_heads.
-+        value_dim_local_cp = self.v_dim_local_tp // self.cp_size
++        # Split qkv into query_key and value
 +        query_key, value = torch.split(
 +            qkv,
-+            [qkv.size(-1) - value_dim_local_cp, value_dim_local_cp],
++            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
 +            dim=-1,
 +        )
 +
@@ -458,9 +449,8 @@ index dfa6e4c35..0e62801f0 100644
 +        if self.use_qk_l2norm:
 +            query_key = l2norm(query_key.contiguous())
 +
-+        # Split query and key using the runtime q/k width. This supports the
-+        # TP gather path where q/k have been widened before entering this helper.
-+        split_size = query_key.size(2) // 2
++        # Split query and key
++        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
 +        query, key = torch.split(query_key, [split_size, split_size], dim=2)
 +
 +        # Expand query and key if needed (grouped query attention)
@@ -468,16 +458,6 @@ index dfa6e4c35..0e62801f0 100644
 +            repeat_factor = self.num_value_heads // self.num_key_heads
 +            query = query.repeat_interleave(repeat_factor, dim=2)
 +            key = key.repeat_interleave(repeat_factor, dim=2)
-+
-+        if self.gather_qk_after_conv and query.size(2) != value.size(2):
-+            assert query.size(2) % value.size(2) == 0, (
-+                f"Expected gathered q/k heads ({query.size(2)}) to be a multiple of local value heads "
-+                f"({value.size(2)})."
-+            )
-+            shards_per_value_group = query.size(2) // value.size(2)
-+            idx = get_tensor_model_parallel_rank() % shards_per_value_group
-+            query = query[:, :, idx * value.size(2) : (idx + 1) * value.size(2), :]
-+            key = key[:, :, idx * value.size(2) : (idx + 1) * value.size(2), :]
 +
 +        # Make all tensors contiguous
 +        query = query.contiguous()
@@ -502,7 +482,7 @@ index dfa6e4c35..0e62801f0 100644
      def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
          """Provide a sharded state dictionary for distributed checkpointing."""
          # Guard for cases metadata is not provided
-@@ -479,10 +590,10 @@ class GatedDeltaNet(MegatronModule):
+@@ -479,10 +556,10 @@ class GatedDeltaNet(MegatronModule):
          sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
              sharded_state_dict[f"{prefix}in_proj.weight"],
              [
@@ -517,7 +497,7 @@ index dfa6e4c35..0e62801f0 100644
                  self.num_value_heads // self.tp_size,
                  self.num_value_heads // self.tp_size,
              ],
-@@ -502,18 +613,30 @@ class GatedDeltaNet(MegatronModule):
+@@ -502,18 +579,30 @@ class GatedDeltaNet(MegatronModule):
          for conv_layer_name in conv_layer_name_list:
              sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
                  sharded_state_dict[f"{prefix}{conv_layer_name}"],
@@ -553,7 +533,7 @@ index dfa6e4c35..0e62801f0 100644
  def _split_tensor_factory(
      orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
  ) -> ShardedTensorFactory:
-@@ -574,6 +697,184 @@ def _split_tensor_factory(
+@@ -574,6 +663,184 @@ def _split_tensor_factory(
      )
  
  
@@ -738,7 +718,7 @@ index dfa6e4c35..0e62801f0 100644
  def torch_chunk_gated_delta_rule(
      query,
      key,
-@@ -666,4 +967,4 @@ def torch_chunk_gated_delta_rule(
+@@ -666,4 +933,4 @@ def torch_chunk_gated_delta_rule(
      )
      core_attn_out = core_attn_out[:, :, :sequence_length]
      core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
@@ -1638,54 +1618,6 @@ index d0ceca7af..668957b43 100644
  
  class WrappedTorchNorm:
      """
-diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index e2705bd9f..7f6a3d5a4 100644
---- a/megatron/core/transformer/transformer_config.py
-+++ b/megatron/core/transformer/transformer_config.py
-@@ -880,9 +880,12 @@ class TransformerConfig(ModelParallelConfig):
-         if self.num_query_groups is None:
-             self.num_query_groups = self.num_attention_heads
- 
--        if self.num_query_groups % self.tensor_model_parallel_size != 0:
-+        if (
-+            self.num_query_groups % self.tensor_model_parallel_size != 0
-+            and self.tensor_model_parallel_size % self.num_query_groups != 0
-+        ):
-             raise ValueError(
--                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
-+                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
-                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
-             )
- 
-@@ -921,18 +924,17 @@ class TransformerConfig(ModelParallelConfig):
-                     f"linear_num_key_heads ({self.linear_num_key_heads})."
-                 )
- 
--                # Check tensor parallelism compatibility
--                assert (
--                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
--                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                 assert (
--                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
--                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
--
--                # Do not support yet, but coming soon.
--                assert self.context_parallel_size == 1, (
--                    f"Gated delta net does not support context parallel for now,"
--                    f" but got {self.context_parallel_size=}."
-+                    self.linear_num_key_heads % tp_cp_size == 0
-+                    or tp_cp_size % self.linear_num_key_heads == 0
-+                ), (
-+                    f"linear_num_key_heads ({self.linear_num_key_heads}) must be a multiple or divisor of "
-+                    f"tp_cp_size ({tp_cp_size})."
-+                )
-+                assert self.linear_num_value_heads % tp_cp_size == 0, (
-+                    f"{self.linear_num_value_heads=} must be a multiple of "
-+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                 )
-         elif self.experimental_attention_variant == "dsa":
-             assert (
 diff --git a/megatron/core/typed_torch.py b/megatron/core/typed_torch.py
 new file mode 100644
 index 000000000..258381ffa
@@ -1929,3 +1861,362 @@ index 0faf2cac4..726f0a0a7 100644
  
  _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
  
+-- 
+2.34.1
+
+
+From fb35e65aa00c39ed04a384c2319b30a832887e64 Mon Sep 17 00:00:00 2001
+From: "yufan.yufan" <yufan.yufan@bytedance.com>
+Date: Wed, 25 Mar 2026 03:08:29 +0000
+Subject: [PATCH 2/4] cherry-pick attention at main & gdn at dev
+
+---
+ .../core/transformer/transformer_config.py    | 20 ++++++++-----------
+ 1 file changed, 8 insertions(+), 12 deletions(-)
+
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index e2705bd9f..a7c847acc 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -921,18 +921,14 @@ class TransformerConfig(ModelParallelConfig):
+                     f"linear_num_key_heads ({self.linear_num_key_heads})."
+                 )
+ 
+-                # Check tensor parallelism compatibility
+-                assert (
+-                    self.linear_num_key_heads % self.tensor_model_parallel_size == 0
+-                ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+-                assert (
+-                    self.linear_num_value_heads % self.tensor_model_parallel_size == 0
+-                ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+-
+-                # Do not support yet, but coming soon.
+-                assert self.context_parallel_size == 1, (
+-                    f"Gated delta net does not support context parallel for now,"
+-                    f" but got {self.context_parallel_size=}."
++                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
++                assert self.linear_num_key_heads % tp_cp_size == 0, (
++                    f"{self.linear_num_key_heads=} must be a multiple of "
++                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
++                )
++                assert self.linear_num_value_heads % tp_cp_size == 0, (
++                    f"{self.linear_num_value_heads=} must be a multiple of "
++                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                 )
+         elif self.experimental_attention_variant == "dsa":
+             assert (
+-- 
+2.34.1
+
+
+From 38c06bedda4ef498ac78389800f4b334adfd7c4c Mon Sep 17 00:00:00 2001
+From: "yufan.yufan" <yufan.yufan@bytedance.com>
+Date: Wed, 25 Mar 2026 06:47:21 +0000
+Subject: [PATCH 3/4] cherry-pick transformer_config at main
+
+---
+ megatron/core/transformer/transformer_config.py | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index a7c847acc..03dced399 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -880,9 +880,12 @@ class TransformerConfig(ModelParallelConfig):
+         if self.num_query_groups is None:
+             self.num_query_groups = self.num_attention_heads
+ 
+-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
++        if (
++            self.num_query_groups % self.tensor_model_parallel_size != 0
++            and self.tensor_model_parallel_size % self.num_query_groups != 0
++        ):
+             raise ValueError(
+-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
++                f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
+                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+             )
+ 
+-- 
+2.34.1
+
+
+From 12a05f933d2b60fee553d95c28db4bcec4a6985b Mon Sep 17 00:00:00 2001
+From: "yufan.yufan" <yufan.yufan@bytedance.com>
+Date: Fri, 3 Apr 2026 03:36:16 +0000
+Subject: [PATCH 4/4] support cp=linear_num_key_heads
+
+---
+ megatron/core/ssm/gated_delta_net.py          | 128 ++++++++++++++----
+ .../core/transformer/transformer_config.py    |   4 +-
+ 2 files changed, 105 insertions(+), 27 deletions(-)
+
+diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
+index ed9f4ff2e..3e21d56e8 100644
+--- a/megatron/core/ssm/gated_delta_net.py
++++ b/megatron/core/ssm/gated_delta_net.py
+@@ -21,6 +21,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.jit import jit_fuser
+ from megatron.core.packed_seq_params import PackedSeqParams
+ from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.parallel_state import get_tensor_model_parallel_rank
+ from megatron.core.ssm.mamba_context_parallel import (
+     _all_to_all_cp2hp,
+     _all_to_all_hp2cp,
+@@ -28,6 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
+     _undo_attention_load_balancing,
+ )
+ from megatron.core.tensor_parallel import get_cuda_rng_tracker
++from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+ from megatron.core.transformer import TransformerConfig
+ from megatron.core.transformer.identity_op import IdentityOp
+ from megatron.core.transformer.module import MegatronModule
+@@ -136,6 +138,12 @@ class GatedDeltaNet(MegatronModule):
+         self.v_dim = self.value_head_dim * self.num_value_heads
+         self.qk_dim_local_tp = self.qk_dim // self.tp_size
+         self.v_dim_local_tp = self.v_dim // self.tp_size
++        self.duplicate_full_qkv_before_cp2hp = (
++            self.tp_size > 1
++            and self.cp_size > 1
++            and self.num_key_heads % (self.tp_size * self.cp_size) != 0
++            and self.cp_size > self.tp_size
++        )
+ 
+         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
+         # TODO: for now, output gate is forced for GDN.
+@@ -302,6 +310,8 @@ class GatedDeltaNet(MegatronModule):
+         # Input projection
+         nvtx_range_push(suffix="in_proj")
+         qkvzba, _ = self.in_proj(hidden_states)
++        if self.duplicate_full_qkv_before_cp2hp:
++            qkvzba = _all_gather_cat_no_reduce(qkvzba, dim=-1, group=self.pg_collection.tp)
+         nvtx_range_pop(suffix="in_proj")
+ 
+         # CP All to All: CP to HP
+@@ -311,12 +321,16 @@ class GatedDeltaNet(MegatronModule):
+             head_dim=-1,
+             cp_group=self.pg_collection.cp,
+             split_sections=[
+-                self.qk_dim_local_tp,
+-                self.qk_dim_local_tp,
+-                self.v_dim_local_tp,
+-                self.v_dim_local_tp,
+-                self.num_value_heads // self.tp_size,
+-                self.num_value_heads // self.tp_size,
++                self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
++                self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
++                self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
++                self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
++                self.num_value_heads
++                if self.duplicate_full_qkv_before_cp2hp
++                else self.num_value_heads // self.tp_size,
++                self.num_value_heads
++                if self.duplicate_full_qkv_before_cp2hp
++                else self.num_value_heads // self.tp_size,
+             ],
+         )
+ 
+@@ -328,10 +342,26 @@ class GatedDeltaNet(MegatronModule):
+         qkv, gate, beta, alpha = torch.split(
+             qkvzba,
+             [
+-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+-                self.v_dim_local_tp // self.cp_size,
+-                self.num_value_heads // self.tp_size // self.cp_size,
+-                self.num_value_heads // self.tp_size // self.cp_size,
++                (
++                    (self.qk_dim * 2 + self.v_dim)
++                    if self.duplicate_full_qkv_before_cp2hp
++                    else (self.qk_dim_local_tp * 2 + self.v_dim_local_tp)
++                )
++                // self.cp_size,
++                (self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp)
++                // self.cp_size,
++                (
++                    self.num_value_heads
++                    if self.duplicate_full_qkv_before_cp2hp
++                    else self.num_value_heads // self.tp_size
++                )
++                // self.cp_size,
++                (
++                    self.num_value_heads
++                    if self.duplicate_full_qkv_before_cp2hp
++                    else self.num_value_heads // self.tp_size
++                )
++                // self.cp_size,
+             ],
+             dim=-1,
+         )
+@@ -343,19 +373,29 @@ class GatedDeltaNet(MegatronModule):
+         nvtx_range_push(suffix="conv1d")
+         seq_len = qkv.shape[1]
+         qkv_channels_split_sections = [
+-            self.qk_dim_local_tp,
+-            self.qk_dim_local_tp,
+-            self.v_dim_local_tp,
++            self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
++            self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
++            self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
+         ]
++        conv1d_weight_base = self.conv1d.weight
++        conv1d_bias_base = self.conv1d.bias
++        if self.duplicate_full_qkv_before_cp2hp:
++            conv1d_weight_base = _all_gather_cat_no_reduce(
++                conv1d_weight_base, dim=0, group=self.pg_collection.tp
++            )
++            if self.conv_bias:
++                conv1d_bias_base = _all_gather_cat_no_reduce(
++                    conv1d_bias_base, dim=0, group=self.pg_collection.tp
++                )
+         conv1d_weight = get_parameter_local_cp(
+-            self.conv1d.weight,
++            conv1d_weight_base,
+             dim=0,
+             cp_group=self.pg_collection.cp,
+             split_sections=qkv_channels_split_sections,
+         )
+         conv1d_bias = (
+             get_parameter_local_cp(
+-                self.conv1d.bias,
++                conv1d_bias_base,
+                 dim=0,
+                 cp_group=self.pg_collection.cp,
+                 split_sections=qkv_channels_split_sections,
+@@ -372,7 +412,10 @@ class GatedDeltaNet(MegatronModule):
+                 stride=self.conv1d.stride,
+                 padding=self.conv1d.padding,
+                 dilation=self.conv1d.dilation,
+-                groups=self.conv_dim_local_tp // self.cp_size,
++                groups=(
++                    self.conv_dim if self.duplicate_full_qkv_before_cp2hp else self.conv_dim_local_tp
++                )
++                // self.cp_size,
+             )
+             qkv = self.act_fn(conv_out[..., :seq_len])
+             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+@@ -397,9 +440,16 @@ class GatedDeltaNet(MegatronModule):
+ 
+         # Calculate g and beta
+         nvtx_range_push(suffix="g_and_beta")
+-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
++        A_log_base = self.A_log
++        dt_bias_base = self.dt_bias
++        if self.duplicate_full_qkv_before_cp2hp:
++            A_log_base = _all_gather_cat_no_reduce(A_log_base, dim=0, group=self.pg_collection.tp)
++            dt_bias_base = _all_gather_cat_no_reduce(
++                dt_bias_base, dim=0, group=self.pg_collection.tp
++            )
++        A_log_local_cp = get_parameter_local_cp(A_log_base, dim=0, cp_group=self.pg_collection.cp)
+         dt_bias_local_cp = get_parameter_local_cp(
+-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
++            dt_bias_base, dim=0, cp_group=self.pg_collection.cp
+         )
+         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
+         nvtx_range_pop(suffix="g_and_beta")
+@@ -426,11 +476,14 @@ class GatedDeltaNet(MegatronModule):
+         # From bshd back to sbhd format
+         norm_out = norm_out.reshape(batch, seq_len, -1)
+         norm_out = norm_out.transpose(0, 1).contiguous()
+-
+         # CP all to all: HP to CP
+         norm_out = tensor_a2a_hp2cp(
+             norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+         )
++        if self.duplicate_full_qkv_before_cp2hp:
++            tp_rank = self.pg_collection.tp.rank()
++            tp_start = tp_rank * self.v_dim_local_tp
++            norm_out = norm_out[..., tp_start : tp_start + self.v_dim_local_tp].contiguous()
+ 
+         # Output projection
+         nvtx_range_push(suffix="out_proj")
+@@ -457,10 +510,11 @@ class GatedDeltaNet(MegatronModule):
+         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
+         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+         """
+-        # Split qkv into query_key and value
++        qk_dim_before_cp = self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp
++        v_dim_before_cp = self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp
+         query_key, value = torch.split(
+             qkv,
+-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
++            [2 * qk_dim_before_cp // self.cp_size, v_dim_before_cp // self.cp_size],
+             dim=-1,
+         )
+ 
+@@ -472,8 +526,7 @@ class GatedDeltaNet(MegatronModule):
+         if self.use_qk_l2norm:
+             query_key = l2norm(query_key.contiguous())
+ 
+-        # Split query and key
+-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
++        split_size = qk_dim_before_cp // self.key_head_dim // self.cp_size
+         query, key = torch.split(query_key, [split_size, split_size], dim=2)
+ 
+         # Expand query and key if needed (grouped query attention)
+@@ -498,7 +551,7 @@ class GatedDeltaNet(MegatronModule):
+         Compute g (decay) and beta (sigmoid) for gated delta rule.
+         Fuses exp, softplus, mul, neg, and sigmoid operations.
+         """
+-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
++        g = -A_log_local_cp.float().exp() * F.softplus(alpha.float() + dt_bias_local_cp.float())
+         beta = beta.sigmoid()
+         return g, beta
+ 
+@@ -837,6 +890,31 @@ def tensor_a2a_hp2cp(
+ 
+     return tensor
+ 
++class _AllGatherCatNoReduce(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, dim, group):
++        ctx.dim = dim
++        ctx.group = group
++        ctx.rank = torch.distributed.get_rank(group=group)
++        world_size = torch.distributed.get_world_size(group=group)
++        outputs = [torch.empty_like(x) for _ in range(world_size)]
++        torch.distributed.all_gather(outputs, x.contiguous(), group=group)
++        return torch.cat(outputs, dim=dim)
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        dim = ctx.dim if ctx.dim >= 0 else grad_output.dim() + ctx.dim
++        world_size = torch.distributed.get_world_size(group=ctx.group)
++        split_size = grad_output.size(dim) // world_size
++        grad_input = torch.narrow(grad_output, dim, ctx.rank * split_size, split_size).contiguous()
++        return grad_input, None, None
++
++
++def _all_gather_cat_no_reduce(x, dim, group):
++    if torch.distributed.get_world_size(group=group) == 1:
++        return x
++    return _AllGatherCatNoReduce.apply(x, dim, group)
++
+ 
+ ####################
+ # Torch native gated delta rule
+@@ -933,4 +1011,4 @@ def torch_chunk_gated_delta_rule(
+     )
+     core_attn_out = core_attn_out[:, :, :sequence_length]
+     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+-    return core_attn_out, last_recurrent_state
+\ No newline at end of file
++    return core_attn_out, last_recurrent_state
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 03dced399..c61fc983d 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -925,9 +925,9 @@ class TransformerConfig(ModelParallelConfig):
+                 )
+ 
+                 tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+-                assert self.linear_num_key_heads % tp_cp_size == 0, (
++                assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0 and self.linear_num_value_heads % self.context_parallel_size == 0, (
+                     f"{self.linear_num_key_heads=} must be a multiple of "
+-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
++                    f"({self.tensor_model_parallel_size=} and {self.context_parallel_size=})."
+                 )
+                 assert self.linear_num_value_heads % tp_cp_size == 0, (
+                     f"{self.linear_num_value_heads=} must be a multiple of "
+-- 
+2.34.1
+
