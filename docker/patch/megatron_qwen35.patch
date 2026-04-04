@@ -1864,6 +1864,32 @@ index 0faf2cac4..726f0a0a7 100644
 -- 
 2.34.1
 
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 3 Apr 2026 04:06:00 +0000
+Subject: [PATCH 5/5] set filesystem_async preload tensor copy non_blocking
+ false
+
+---
+ .../dist_checkpointing/strategies/filesystem_async.py      | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/megatron/core/dist_checkpointing/strategies/filesystem_async.py b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+index b23c4e989..dd4b40070 100644
+--- a/megatron/core/dist_checkpointing/strategies/filesystem_async.py
++++ b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+@@ -223,7 +223,7 @@ class FileSystemWriterAsync(FileSystemWriter):
+         for bucket in write_buckets:
+             file_name, storage_key, (bytes_data, tensor_data) = bucket
+             tensor_data = [
+-                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
++                (item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data
+             ]
+             result.append((file_name, storage_key, (bytes_data, tensor_data)))
+         if non_blocking:
+-- 
+2.34.1
+
 
 From fb35e65aa00c39ed04a384c2319b30a832887e64 Mon Sep 17 00:00:00 2001
 From: "yufan.yufan" <yufan.yufan@bytedance.com>
@@ -2219,4 +2245,3 @@ index 03dced399..c61fc983d 100644
                      f"{self.linear_num_value_heads=} must be a multiple of "
 -- 
 2.34.1
-
