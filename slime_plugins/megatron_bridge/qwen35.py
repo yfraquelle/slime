@@ -454,12 +454,6 @@ class SlimeQwen35VLModel(Qwen3VLModel):
 
                 local_vision_count = int(vision_mask.sum().item()) if vision_mask is not None else 0
                 embed_count = int(vision_embeds.shape[0]) if vision_embeds is not None else 0
-                # print(
-                #     f"[Rank {rank}] cp_rank={cp_rank} qwen35_cp_align "
-                #     f"input_ids={tuple(input_ids.shape)} "
-                #     f"vision_mask={local_vision_count} "
-                #     f"vision_embeds={embed_count}"
-                # )
 
             combined_embeddings = self.language_model.embedding(
                 input_ids=input_ids,

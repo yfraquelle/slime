@@ -1,4 +1,4 @@
-From e7b5daa0a6b995c577d5fb8cbcfe20a4fde48cd1 Mon Sep 17 00:00:00 2001
+From 81b50b2cc4372cb11b1afa256cec7e5d158e8094 Mon Sep 17 00:00:00 2001
 From: "yufan.yufan" <yufan.yufan@bytedance.com>
 Date: Wed, 25 Mar 2026 02:47:59 +0000
 Subject: [PATCH 1/4] cherry-pick attention at main & gdn at dev
@@ -1864,34 +1864,8 @@ index 0faf2cac4..726f0a0a7 100644
 -- 
 2.34.1
 
-From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
-From: Codex <codex@openai.com>
-Date: Fri, 3 Apr 2026 04:06:00 +0000
-Subject: [PATCH 5/5] set filesystem_async preload tensor copy non_blocking
- false
 
----
- .../dist_checkpointing/strategies/filesystem_async.py      | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/megatron/core/dist_checkpointing/strategies/filesystem_async.py b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
-index b23c4e989..dd4b40070 100644
---- a/megatron/core/dist_checkpointing/strategies/filesystem_async.py
-+++ b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
-@@ -223,7 +223,7 @@ class FileSystemWriterAsync(FileSystemWriter):
-         for bucket in write_buckets:
-             file_name, storage_key, (bytes_data, tensor_data) = bucket
-             tensor_data = [
--                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
-+                (item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data
-             ]
-             result.append((file_name, storage_key, (bytes_data, tensor_data)))
-         if non_blocking:
--- 
-2.34.1
-
-
-From fb35e65aa00c39ed04a384c2319b30a832887e64 Mon Sep 17 00:00:00 2001
+From bda400e750ca35e1c06e11926bb151cb60260bea Mon Sep 17 00:00:00 2001
 From: "yufan.yufan" <yufan.yufan@bytedance.com>
 Date: Wed, 25 Mar 2026 03:08:29 +0000
 Subject: [PATCH 2/4] cherry-pick attention at main & gdn at dev
@@ -1935,7 +1909,7 @@ index e2705bd9f..a7c847acc 100644
 2.34.1
 
 
-From 38c06bedda4ef498ac78389800f4b334adfd7c4c Mon Sep 17 00:00:00 2001
+From 8f1ddbe3ee1f5d364b26ca7138ced6a4349a9412 Mon Sep 17 00:00:00 2001
 From: "yufan.yufan" <yufan.yufan@bytedance.com>
 Date: Wed, 25 Mar 2026 06:47:21 +0000
 Subject: [PATCH 3/4] cherry-pick transformer_config at main
@@ -1967,59 +1941,88 @@ index a7c847acc..03dced399 100644
 2.34.1
 
 
-From 12a05f933d2b60fee553d95c28db4bcec4a6985b Mon Sep 17 00:00:00 2001
+From bbef18726f155cdcb90808e6ea60172007d9dc5b Mon Sep 17 00:00:00 2001
 From: "yufan.yufan" <yufan.yufan@bytedance.com>
-Date: Fri, 3 Apr 2026 03:36:16 +0000
-Subject: [PATCH 4/4] support cp=linear_num_key_heads
+Date: Tue, 7 Apr 2026 02:40:28 +0000
+Subject: [PATCH 4/4] support cp 16 (key_head) for qwen3.5
 
 ---
- megatron/core/ssm/gated_delta_net.py          | 128 ++++++++++++++----
- .../core/transformer/transformer_config.py    |   4 +-
- 2 files changed, 105 insertions(+), 27 deletions(-)
+ .../strategies/filesystem_async.py            |   2 +-
+ megatron/core/ssm/gated_delta_net.py          | 218 +++++++++++++++---
+ .../core/transformer/transformer_config.py    |   7 +-
+ 3 files changed, 194 insertions(+), 33 deletions(-)
 
+diff --git a/megatron/core/dist_checkpointing/strategies/filesystem_async.py b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+index b23c4e989..dd4b40070 100644
+--- a/megatron/core/dist_checkpointing/strategies/filesystem_async.py
++++ b/megatron/core/dist_checkpointing/strategies/filesystem_async.py
+@@ -223,7 +223,7 @@ class FileSystemWriterAsync(FileSystemWriter):
+         for bucket in write_buckets:
+             file_name, storage_key, (bytes_data, tensor_data) = bucket
+             tensor_data = [
+-                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
++                (item, tensor.to("cpu", non_blocking=False)) for item, tensor in tensor_data
+             ]
+             result.append((file_name, storage_key, (bytes_data, tensor_data)))
+         if non_blocking:
 diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
-index ed9f4ff2e..3e21d56e8 100644
+index ed9f4ff2e..e3b1cc2f3 100644
 --- a/megatron/core/ssm/gated_delta_net.py
 +++ b/megatron/core/ssm/gated_delta_net.py
-@@ -21,6 +21,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
- from megatron.core.jit import jit_fuser
- from megatron.core.packed_seq_params import PackedSeqParams
- from megatron.core.process_groups_config import ProcessGroupCollection
-+from megatron.core.parallel_state import get_tensor_model_parallel_rank
- from megatron.core.ssm.mamba_context_parallel import (
-     _all_to_all_cp2hp,
-     _all_to_all_hp2cp,
-@@ -28,6 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
-     _undo_attention_load_balancing,
- )
- from megatron.core.tensor_parallel import get_cuda_rng_tracker
-+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
- from megatron.core.transformer import TransformerConfig
- from megatron.core.transformer.identity_op import IdentityOp
- from megatron.core.transformer.module import MegatronModule
-@@ -136,6 +138,12 @@ class GatedDeltaNet(MegatronModule):
+@@ -136,6 +136,44 @@ class GatedDeltaNet(MegatronModule):
          self.v_dim = self.value_head_dim * self.num_value_heads
          self.qk_dim_local_tp = self.qk_dim // self.tp_size
          self.v_dim_local_tp = self.v_dim // self.tp_size
-+        self.duplicate_full_qkv_before_cp2hp = (
++        self.num_key_heads_local_tp = self.num_key_heads // self.tp_size
++        self.num_value_heads_local_tp = self.num_value_heads // self.tp_size
++        self.num_value_heads_per_key = self.num_value_heads // self.num_key_heads
++
++        # When one TP shard does not contain enough q/k heads to further shard by CP,
++        # gather only q/k across TP before CP. The value path stays TP-local.
++        self.full_tp_before_cp = (
 +            self.tp_size > 1
 +            and self.cp_size > 1
-+            and self.num_key_heads % (self.tp_size * self.cp_size) != 0
-+            and self.cp_size > self.tp_size
++            and self.num_key_heads_local_tp < self.cp_size
 +        )
++
++        self.qk_dim_before_cp = self.qk_dim if self.full_tp_before_cp else self.qk_dim_local_tp
++        self.v_dim_before_cp = self.v_dim_local_tp
++        self.num_key_heads_before_cp = (
++            self.num_key_heads if self.full_tp_before_cp else self.num_key_heads_local_tp
++        )
++        self.num_value_heads_before_cp = self.num_value_heads_local_tp
++        self.gate_dim_before_cp = self.v_dim_before_cp
++        self.beta_alpha_dim_before_cp = self.num_value_heads_before_cp
++        self.conv_dim_before_cp = self.qk_dim_before_cp * 2 + self.v_dim_before_cp
++
++        assert self.num_key_heads_before_cp % self.cp_size == 0, (
++            self.num_key_heads_before_cp,
++            self.cp_size,
++        )
++        assert self.num_value_heads_before_cp % self.cp_size == 0, (
++            self.num_value_heads_before_cp,
++            self.cp_size,
++        )
++
++        self.qk_dim_after_cp = self.qk_dim_before_cp // self.cp_size
++        self.v_dim_after_cp = self.v_dim_before_cp // self.cp_size
++        self.num_key_heads_after_cp = self.num_key_heads_before_cp // self.cp_size
++        self.num_value_heads_after_cp = self.num_value_heads_before_cp // self.cp_size
++        self.gate_dim_after_cp = self.gate_dim_before_cp // self.cp_size
++        self.beta_alpha_dim_after_cp = self.beta_alpha_dim_before_cp // self.cp_size
++        self.conv_dim_after_cp = self.conv_dim_before_cp // self.cp_size
  
          # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
          # TODO: for now, output gate is forced for GDN.
-@@ -302,6 +310,8 @@ class GatedDeltaNet(MegatronModule):
+@@ -302,6 +340,7 @@ class GatedDeltaNet(MegatronModule):
          # Input projection
          nvtx_range_push(suffix="in_proj")
          qkvzba, _ = self.in_proj(hidden_states)
-+        if self.duplicate_full_qkv_before_cp2hp:
-+            qkvzba = _all_gather_cat_no_reduce(qkvzba, dim=-1, group=self.pg_collection.tp)
++        qkvzba = self._prepare_qkvzba_before_cp(qkvzba)
          nvtx_range_pop(suffix="in_proj")
  
          # CP All to All: CP to HP
-@@ -311,12 +321,16 @@ class GatedDeltaNet(MegatronModule):
+@@ -311,12 +350,12 @@ class GatedDeltaNet(MegatronModule):
              head_dim=-1,
              cp_group=self.pg_collection.cp,
              split_sections=[
@@ -2029,20 +2032,16 @@ index ed9f4ff2e..3e21d56e8 100644
 -                self.v_dim_local_tp,
 -                self.num_value_heads // self.tp_size,
 -                self.num_value_heads // self.tp_size,
-+                self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
-+                self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
-+                self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
-+                self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
-+                self.num_value_heads
-+                if self.duplicate_full_qkv_before_cp2hp
-+                else self.num_value_heads // self.tp_size,
-+                self.num_value_heads
-+                if self.duplicate_full_qkv_before_cp2hp
-+                else self.num_value_heads // self.tp_size,
++                self.qk_dim_before_cp,
++                self.qk_dim_before_cp,
++                self.v_dim_before_cp,
++                self.gate_dim_before_cp,
++                self.beta_alpha_dim_before_cp,
++                self.beta_alpha_dim_before_cp,
              ],
          )
  
-@@ -328,10 +342,26 @@ class GatedDeltaNet(MegatronModule):
+@@ -328,34 +367,36 @@ class GatedDeltaNet(MegatronModule):
          qkv, gate, beta, alpha = torch.split(
              qkvzba,
              [
@@ -2050,50 +2049,33 @@ index ed9f4ff2e..3e21d56e8 100644
 -                self.v_dim_local_tp // self.cp_size,
 -                self.num_value_heads // self.tp_size // self.cp_size,
 -                self.num_value_heads // self.tp_size // self.cp_size,
-+                (
-+                    (self.qk_dim * 2 + self.v_dim)
-+                    if self.duplicate_full_qkv_before_cp2hp
-+                    else (self.qk_dim_local_tp * 2 + self.v_dim_local_tp)
-+                )
-+                // self.cp_size,
-+                (self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp)
-+                // self.cp_size,
-+                (
-+                    self.num_value_heads
-+                    if self.duplicate_full_qkv_before_cp2hp
-+                    else self.num_value_heads // self.tp_size
-+                )
-+                // self.cp_size,
-+                (
-+                    self.num_value_heads
-+                    if self.duplicate_full_qkv_before_cp2hp
-+                    else self.num_value_heads // self.tp_size
-+                )
-+                // self.cp_size,
++                2 * self.qk_dim_after_cp + self.v_dim_after_cp,
++                self.gate_dim_after_cp,
++                self.beta_alpha_dim_after_cp,
++                self.beta_alpha_dim_after_cp,
              ],
              dim=-1,
          )
-@@ -343,19 +373,29 @@ class GatedDeltaNet(MegatronModule):
+-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+-        beta = beta.reshape(batch, seq_len, -1)
+-        alpha = alpha.reshape(batch, seq_len, -1)
++        gate = gate.reshape(batch, seq_len, self.num_value_heads_after_cp, self.value_head_dim)
++        beta = beta.reshape(batch, seq_len, self.num_value_heads_after_cp)
++        alpha = alpha.reshape(batch, seq_len, self.num_value_heads_after_cp)
+ 
+         # Convolution on qkv
          nvtx_range_push(suffix="conv1d")
          seq_len = qkv.shape[1]
          qkv_channels_split_sections = [
 -            self.qk_dim_local_tp,
 -            self.qk_dim_local_tp,
 -            self.v_dim_local_tp,
-+            self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
-+            self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp,
-+            self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp,
++            self.qk_dim_before_cp,
++            self.qk_dim_before_cp,
++            self.v_dim_before_cp,
          ]
-+        conv1d_weight_base = self.conv1d.weight
-+        conv1d_bias_base = self.conv1d.bias
-+        if self.duplicate_full_qkv_before_cp2hp:
-+            conv1d_weight_base = _all_gather_cat_no_reduce(
-+                conv1d_weight_base, dim=0, group=self.pg_collection.tp
-+            )
-+            if self.conv_bias:
-+                conv1d_bias_base = _all_gather_cat_no_reduce(
-+                    conv1d_bias_base, dim=0, group=self.pg_collection.tp
-+                )
++        conv1d_weight_base = self._prepare_conv_before_cp(self.conv1d.weight)
++        conv1d_bias_base = self._prepare_conv_before_cp(self.conv1d.bias)
          conv1d_weight = get_parameter_local_cp(
 -            self.conv1d.weight,
 +            conv1d_weight_base,
@@ -2108,30 +2090,22 @@ index ed9f4ff2e..3e21d56e8 100644
                  dim=0,
                  cp_group=self.pg_collection.cp,
                  split_sections=qkv_channels_split_sections,
-@@ -372,7 +412,10 @@ class GatedDeltaNet(MegatronModule):
+@@ -372,7 +413,7 @@ class GatedDeltaNet(MegatronModule):
                  stride=self.conv1d.stride,
                  padding=self.conv1d.padding,
                  dilation=self.conv1d.dilation,
 -                groups=self.conv_dim_local_tp // self.cp_size,
-+                groups=(
-+                    self.conv_dim if self.duplicate_full_qkv_before_cp2hp else self.conv_dim_local_tp
-+                )
-+                // self.cp_size,
++                groups=self.conv_dim_after_cp,
              )
              qkv = self.act_fn(conv_out[..., :seq_len])
              qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-@@ -397,9 +440,16 @@ class GatedDeltaNet(MegatronModule):
+@@ -397,9 +438,11 @@ class GatedDeltaNet(MegatronModule):
  
          # Calculate g and beta
          nvtx_range_push(suffix="g_and_beta")
 -        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-+        A_log_base = self.A_log
-+        dt_bias_base = self.dt_bias
-+        if self.duplicate_full_qkv_before_cp2hp:
-+            A_log_base = _all_gather_cat_no_reduce(A_log_base, dim=0, group=self.pg_collection.tp)
-+            dt_bias_base = _all_gather_cat_no_reduce(
-+                dt_bias_base, dim=0, group=self.pg_collection.tp
-+            )
++        A_log_base = self._regroup_value_tp(self.A_log, dim=0, unit_size=1)
++        dt_bias_base = self._regroup_value_tp(self.dt_bias, dim=0, unit_size=1)
 +        A_log_local_cp = get_parameter_local_cp(A_log_base, dim=0, cp_group=self.pg_collection.cp)
          dt_bias_local_cp = get_parameter_local_cp(
 -            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
@@ -2139,47 +2113,144 @@ index ed9f4ff2e..3e21d56e8 100644
          )
          g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
          nvtx_range_pop(suffix="g_and_beta")
-@@ -426,11 +476,14 @@ class GatedDeltaNet(MegatronModule):
-         # From bshd back to sbhd format
-         norm_out = norm_out.reshape(batch, seq_len, -1)
-         norm_out = norm_out.transpose(0, 1).contiguous()
--
-         # CP all to all: HP to CP
+@@ -431,6 +474,7 @@ class GatedDeltaNet(MegatronModule):
          norm_out = tensor_a2a_hp2cp(
              norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
          )
-+        if self.duplicate_full_qkv_before_cp2hp:
-+            tp_rank = self.pg_collection.tp.rank()
-+            tp_start = tp_rank * self.v_dim_local_tp
-+            norm_out = norm_out[..., tp_start : tp_start + self.v_dim_local_tp].contiguous()
++        norm_out = self._restore_value_tp_for_out_proj(norm_out, dim=-1)
  
          # Output projection
          nvtx_range_push(suffix="out_proj")
-@@ -457,10 +510,11 @@ class GatedDeltaNet(MegatronModule):
+@@ -457,10 +501,9 @@ class GatedDeltaNet(MegatronModule):
          Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
          Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
          """
 -        # Split qkv into query_key and value
-+        qk_dim_before_cp = self.qk_dim if self.duplicate_full_qkv_before_cp2hp else self.qk_dim_local_tp
-+        v_dim_before_cp = self.v_dim if self.duplicate_full_qkv_before_cp2hp else self.v_dim_local_tp
          query_key, value = torch.split(
              qkv,
 -            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-+            [2 * qk_dim_before_cp // self.cp_size, v_dim_before_cp // self.cp_size],
++            [2 * self.qk_dim_after_cp, self.v_dim_after_cp],
              dim=-1,
          )
  
-@@ -472,8 +526,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -472,13 +515,18 @@ class GatedDeltaNet(MegatronModule):
          if self.use_qk_l2norm:
              query_key = l2norm(query_key.contiguous())
  
 -        # Split query and key
 -        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-+        split_size = qk_dim_before_cp // self.key_head_dim // self.cp_size
++        split_size = self.num_key_heads_after_cp
          query, key = torch.split(query_key, [split_size, split_size], dim=2)
  
-         # Expand query and key if needed (grouped query attention)
-@@ -498,7 +551,7 @@ class GatedDeltaNet(MegatronModule):
+-        # Expand query and key if needed (grouped query attention)
+-        if self.num_value_heads // self.num_key_heads > 1:
+-            repeat_factor = self.num_value_heads // self.num_key_heads
++        # Expand query and key if needed (grouped query attention).
++        # In full_tp_before_cp mode, q/k and value may use different before_cp partitioning,
++        # so the repeat factor must follow the local after_cp head counts.
++        assert self.num_value_heads_after_cp % self.num_key_heads_after_cp == 0, (
++            self.num_value_heads_after_cp,
++            self.num_key_heads_after_cp,
++        )
++        repeat_factor = self.num_value_heads_after_cp // self.num_key_heads_after_cp
++        if repeat_factor > 1:
+             query = query.repeat_interleave(repeat_factor, dim=2)
+             key = key.repeat_interleave(repeat_factor, dim=2)
+ 
+@@ -492,13 +540,100 @@ class GatedDeltaNet(MegatronModule):
+ 
+         return query, key, value, gate, beta, alpha
+ 
++    def _maybe_gather_qk_full_tp(
++        self, tensor: Optional[torch.Tensor], dim: int, split_sections: List[int]
++    ):
++        if tensor is None or not self.full_tp_before_cp:
++            return tensor
++        sections = list(torch.split(tensor, split_sections, dim=dim))
++        sections[0] = _all_gather_cat_no_reduce(sections[0], dim=dim, group=self.pg_collection.tp)
++        sections[1] = _all_gather_cat_no_reduce(sections[1], dim=dim, group=self.pg_collection.tp)
++        return torch.cat(sections, dim=dim)
++
++    def _regroup_value_tp(self, tensor: Optional[torch.Tensor], dim: int, unit_size: int):
++        if tensor is None or not self.full_tp_before_cp:
++            return tensor
++        assert self.num_value_heads_per_key % self.tp_size == 0, (
++            self.num_value_heads_per_key,
++            self.tp_size,
++        )
++        tensor = _all_gather_cat_no_reduce(tensor, dim=dim, group=self.pg_collection.tp)
++        tensor = torch.movedim(tensor, dim, -1)
++        tensor = tensor.reshape(
++            *tensor.shape[:-1],
++            self.num_key_heads,
++            self.num_value_heads_per_key,
++            unit_size,
++        )
++        heads_per_rank = self.num_value_heads_per_key // self.tp_size
++        tp_rank = self.pg_collection.tp.rank()
++        start = tp_rank * heads_per_rank
++        tensor = tensor[..., start : start + heads_per_rank, :]
++        tensor = tensor.reshape(*tensor.shape[:-3], self.num_value_heads_local_tp * unit_size)
++        return torch.movedim(tensor, -1, dim).contiguous()
++
++    def _prepare_qkvzba_before_cp(self, qkvzba: torch.Tensor) -> torch.Tensor:
++        if not self.full_tp_before_cp:
++            return qkvzba
++        q, k, v, gate, beta, alpha = torch.split(
++            qkvzba,
++            [
++                self.qk_dim_local_tp,
++                self.qk_dim_local_tp,
++                self.v_dim_local_tp,
++                self.v_dim_local_tp,
++                self.num_value_heads_local_tp,
++                self.num_value_heads_local_tp,
++            ],
++            dim=-1,
++        )
++        q = _all_gather_cat_no_reduce(q, dim=-1, group=self.pg_collection.tp)
++        k = _all_gather_cat_no_reduce(k, dim=-1, group=self.pg_collection.tp)
++        v = self._regroup_value_tp(v, dim=-1, unit_size=self.value_head_dim)
++        gate = self._regroup_value_tp(gate, dim=-1, unit_size=self.value_head_dim)
++        beta = self._regroup_value_tp(beta, dim=-1, unit_size=1)
++        alpha = self._regroup_value_tp(alpha, dim=-1, unit_size=1)
++        return torch.cat([q, k, v, gate, beta, alpha], dim=-1)
++
++    def _prepare_conv_before_cp(self, tensor: Optional[torch.Tensor]):
++        if tensor is None or not self.full_tp_before_cp:
++            return tensor
++        q, k, v = torch.split(
++            tensor,
++            [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp],
++            dim=0,
++        )
++        q = _all_gather_cat_no_reduce(q, dim=0, group=self.pg_collection.tp)
++        k = _all_gather_cat_no_reduce(k, dim=0, group=self.pg_collection.tp)
++        v = self._regroup_value_tp(v, dim=0, unit_size=self.value_head_dim)
++        return torch.cat([q, k, v], dim=0)
++
++    def _restore_value_tp_for_out_proj(self, tensor: torch.Tensor, dim: int):
++        if not self.full_tp_before_cp:
++            return tensor
++        heads_per_rank = self.num_value_heads_per_key // self.tp_size
++        tensor = torch.movedim(tensor, dim, -1)
++        tensor = tensor.reshape(
++            *tensor.shape[:-1],
++            self.num_key_heads,
++            heads_per_rank,
++            self.value_head_dim,
++        )
++        tensor = _all_gather_cat_no_reduce(tensor, dim=-2, group=self.pg_collection.tp)
++        tensor = tensor.reshape(*tensor.shape[:-3], self.num_value_heads, self.value_head_dim)
++        tensor = tensor.reshape(*tensor.shape[:-2], self.v_dim)
++        tp_rank = self.pg_collection.tp.rank()
++        start = tp_rank * self.v_dim_local_tp
++        tensor = tensor[..., start : start + self.v_dim_local_tp]
++        return torch.movedim(tensor, -1, dim).contiguous()
++
+     @jit_fuser
+     def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
+         """
          Compute g (decay) and beta (sigmoid) for gated delta rule.
          Fuses exp, softplus, mul, neg, and sigmoid operations.
          """
@@ -2188,7 +2259,7 @@ index ed9f4ff2e..3e21d56e8 100644
          beta = beta.sigmoid()
          return g, beta
  
-@@ -837,6 +890,31 @@ def tensor_a2a_hp2cp(
+@@ -837,6 +972,31 @@ def tensor_a2a_hp2cp(
  
      return tensor
  
@@ -2220,28 +2291,26 @@ index ed9f4ff2e..3e21d56e8 100644
  
  ####################
  # Torch native gated delta rule
-@@ -933,4 +1011,4 @@ def torch_chunk_gated_delta_rule(
-     )
-     core_attn_out = core_attn_out[:, :, :sequence_length]
-     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
--    return core_attn_out, last_recurrent_state
-\ No newline at end of file
-+    return core_attn_out, last_recurrent_state
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 03dced399..c61fc983d 100644
+index 03dced399..58967682d 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -925,9 +925,9 @@ class TransformerConfig(ModelParallelConfig):
+@@ -924,11 +924,12 @@ class TransformerConfig(ModelParallelConfig):
+                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                  )
  
-                 tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+-                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
 -                assert self.linear_num_key_heads % tp_cp_size == 0, (
 +                assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0 and self.linear_num_value_heads % self.context_parallel_size == 0, (
                      f"{self.linear_num_key_heads=} must be a multiple of "
 -                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
 +                    f"({self.tensor_model_parallel_size=} and {self.context_parallel_size=})."
                  )
++
++                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
                  assert self.linear_num_value_heads % tp_cp_size == 0, (
                      f"{self.linear_num_value_heads=} must be a multiple of "
+                     f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
 -- 
 2.34.1
+
