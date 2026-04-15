@@ -3,6 +3,7 @@ import os
 
 import megatron.bridge.training.model_load_save as _model_load_save_module
 from megatron.bridge import AutoBridge
+import slime_plugins.megatron_bridge  # noqa: F401
 
 
 # Here we need to patch Megatron Bridge's `load_model_config`, since the checkpoint is saved
@@ -12,13 +13,23 @@ _original_load_model_config = _model_load_save_module.load_model_config
 
 
 def _patched_load_model_config(checkpoint_path):
-    model_cfg, mlm_args = _original_load_model_config(checkpoint_path)
     provider = _provider_override.get("provider")
+    if provider is not None:
+        try:
+            from megatron.bridge.training.mlm_compat.arguments import _load_args_from_checkpoint
+
+            mlm_args = _load_args_from_checkpoint(checkpoint_path)
+            print(f"[convert] Using Bridge provider directly for MLM checkpoint: {type(provider).__name__}")
+            return provider, mlm_args
+        except AssertionError:
+            pass
+
+    model_cfg, mlm_args = _original_load_model_config(checkpoint_path)
     if provider is not None:
         from megatron.bridge.models.model_provider import ModelProviderMixin
 
         if not isinstance(model_cfg, ModelProviderMixin):
-            print(f"[convert] Overriding MLM TransformerConfig with Bridge provider: " f"{type(provider).__name__}")
+            print(f"[convert] Overriding MLM TransformerConfig with Bridge provider: {type(provider).__name__}")
             return provider, mlm_args
     return model_cfg, mlm_args
 
